@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Generated reports
+*.xlsx
+stocks_report_*.xlsx
+
+# Run logs
+*.log
+
+# Binary deliverable snapshots
+*.zip
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+.claude/settings.local.json
