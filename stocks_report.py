@@ -1553,14 +1553,15 @@ def _cmd_setup_buttons(args) -> int:
         except Exception:
             pass
 
-        # 2. Remove any existing buttons we added previously (idempotent).
+        # 2. Remove any prior StockPicker_* shapes we added (idempotent —
+        #    covers buttons + the test-mode checkbox).
         for shp in list(main.shapes):
             if shp.name.startswith("StockPicker_"):
                 shp.delete()
 
         # 3. Add two buttons + a Test-mode checkbox in the Jobs area to the
         #    right of column B. Column A (~38 chars ≈ 270 px) and column B
-        #    (~60 chars ≈ 430 px) together reach left=700, so buttons live
+        #    (~60 chars ≈ 430 px) together reach left=700, so controls live
         #    at left=720+ to avoid hiding either.
         #    Shapes.AddFormControl(type, left, top, w, h):
         #      0 = msoFormControlButton
@@ -1574,6 +1575,24 @@ def _cmd_setup_buttons(args) -> int:
         btn2.Name = "StockPicker_GetQuotes"
         btn2.TextFrame.Characters().Text = "Get Quotes"
         btn2.OnAction = "GetQuotes"
+
+        # 4. Add a Test-mode checkbox, linked to Main!B5 (the existing
+        #    MAIN_CELLS["TestMode"] address). Excel writes TRUE/FALSE into
+        #    the linked cell automatically when the user clicks it, and
+        #    read_test_mode() already understands those values.
+        chk = sheet_api.Shapes.AddFormControl(1, 720, 78, 160, 24)
+        chk.Name = "StockPicker_TestMode"
+        chk.TextFrame.Characters().Text = "Test mode (BEL20 + 1 quote)"
+        chk.ControlFormat.LinkedCell = f"Main!{MAIN_CELLS['TestMode']}"
+        # Default state: unchecked (xlOff = -4146). If the user previously
+        # set the cell to TRUE manually, mirror that into the checkbox.
+        existing = main.range(MAIN_CELLS["TestMode"]).value
+        if isinstance(existing, str) and existing.strip().upper() in _TEST_MODE_TRUTHY:
+            chk.ControlFormat.Value = 1   # xlOn
+        elif existing is True:
+            chk.ControlFormat.Value = 1
+        else:
+            chk.ControlFormat.Value = -4146  # xlOff
 
         # 4. SaveAs .xlsm (FileFormat 52 = xlOpenXMLWorkbookMacroEnabled).
         if target.exists() and target != src:
