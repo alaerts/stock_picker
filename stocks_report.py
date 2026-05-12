@@ -54,8 +54,10 @@ from typing import Optional
 import pandas as pd
 import requests
 import yfinance as yf
-from openpyxl.styles import Font
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -676,25 +678,157 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
                 ws.cell(row=row_idx, column=col_idx).number_format = "#,##0.00"
 
 # ---------------------------------------------------------------------------
+# Persistent workbook — Main + Market sheets
+# ---------------------------------------------------------------------------
+#
+# The "two jobs" architecture stores everything in a single .xlsx (later .xlsm
+# with xlwings buttons). Two sheets:
+#
+#   Main   — user-maintained portfolio plus job controls, status, metadata.
+#            Survives every job run; rebuild_inventory and get_quotes never
+#            modify rows the user owns (portfolio area), only the named cells.
+#   Market — full inventory of stocks across all tracked indexes. Job 1
+#            (rebuild_inventory) overwrites this in full; Job 2 (get_quotes)
+#            updates the quote/PE/timestamp columns by Symbol key.
+
+DEFAULT_WORKBOOK_PATH = Path("stocks.xlsx")
+
+# Market sheet column order. Fixed by index — every part of the code that
+# reads/writes Market locates columns by name via this list.
+MARKET_COLUMNS = [
+    "Symbol", "Name", "Owned?", "Indexes", "Sector", "Watchlists", "Currency",
+    "Today (EUR)", "1D ago (EUR)", "1W ago (EUR)", "1M ago (EUR)",
+    "6M ago (EUR)", "1Y ago (EUR)", "5Y ago (EUR)",
+    "P/E (TTM)", "Forward P/E",
+    "Description", "Last update (UTC)", "Last error",
+]
+
+# Main sheet — named cells. Code reads/writes these by name; layout can
+# move within the sheet as long as the dict tracks it.
+MAIN_CELLS: dict[str, str] = {
+    "TestMode":       "B21",  # TRUE / FALSE
+    "Status":         "B22",  # live progress text written during job runs
+    "LastRebuildAt":  "B25",
+    "LastQuotesAt":   "B26",
+    "MarketRowCount": "B27",
+    "EurUsd":         "B28",
+    "EurJpy":         "B29",
+    "EurGbp":         "B30",
+}
+
+# Portfolio area on Main: header row + N rows for user entries.
+PORTFOLIO_HEADER_ROW = 4
+PORTFOLIO_FIRST_ROW = 5
+PORTFOLIO_LAST_ROW = 100  # user can have up to 96 manual entries
+
+
+def _bold(cell, size: int = 11) -> None:
+    cell.font = Font(bold=True, size=size)
+
+
+def _layout_main_sheet(ws: Worksheet) -> None:
+    """Write the static layout of the Main sheet — title, portfolio header,
+    section labels, metadata field labels. Does NOT touch user data cells."""
+    ws["A1"] = "Stock Picker"
+    _bold(ws["A1"], size=16)
+
+    ws["A3"] = "Portfolio (manual — list every Symbol you own)"
+    _bold(ws["A3"], size=12)
+
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=1, value="Symbol")
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=2, value="Quantity")
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=3, value="Notes")
+    for col in (1, 2, 3):
+        _bold(ws.cell(row=PORTFOLIO_HEADER_ROW, column=col))
+
+    ws["A19"] = "Jobs"
+    _bold(ws["A19"], size=12)
+    ws["A20"] = "(buttons wired via xlwings — see README)"
+    ws["A20"].font = Font(italic=True, color="666666")
+
+    ws["A21"] = "Test mode (only refresh BEL20 + 1 quote):"
+    ws["A22"] = "Status:"
+
+    ws["A24"] = "Metadata"
+    _bold(ws["A24"], size=12)
+
+    ws["A25"] = "Last rebuild_inventory:"
+    ws["A26"] = "Last get_quotes:"
+    ws["A27"] = "Total rows in Market:"
+    ws["A28"] = "EUR/USD (1 EUR = X USD):"
+    ws["A29"] = "EUR/JPY (1 EUR = X JPY):"
+    ws["A30"] = "EUR/GBP (1 EUR = X GBP):"
+
+    # Column widths
+    ws.column_dimensions["A"].width = 36
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 40
+
+
+def _layout_market_sheet(ws: Worksheet) -> None:
+    """Write Market sheet headers, freeze pane, column widths. Does not touch
+    data rows."""
+    for col_idx, name in enumerate(MARKET_COLUMNS, 1):
+        cell = ws.cell(row=1, column=col_idx, value=name)
+        _bold(cell)
+        cell.fill = PatternFill("solid", fgColor="F2F2F2")
+    ws.freeze_panes = "A2"
+
+    # Per-column widths tuned for readability. Description is wide; quote
+    # columns stay narrow.
+    widths = {
+        "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18, "Sector": 22,
+        "Watchlists": 38, "Currency": 10,
+        "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
+        "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
+        "P/E (TTM)": 10, "Forward P/E": 10,
+        "Description": 60, "Last update (UTC)": 20, "Last error": 30,
+    }
+    for col_idx, name in enumerate(MARKET_COLUMNS, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
+
+
+def init_workbook(path: Path) -> Path:
+    """Create or refresh the persistent workbook layout.
+
+    Idempotent: if ``path`` exists, this function preserves all user data and
+    only re-asserts headers, section labels, and column widths. It will never
+    blow away the portfolio area or the Market data rows.
+    """
+    path = Path(path)
+    if path.exists():
+        log.info(f"Refreshing workbook layout in {path} (data preserved)")
+        wb = load_workbook(path)
+        main_ws = wb["Main"] if "Main" in wb.sheetnames else wb.create_sheet("Main", 0)
+        market_ws = wb["Market"] if "Market" in wb.sheetnames else wb.create_sheet("Market", 1)
+    else:
+        log.info(f"Creating workbook {path}")
+        wb = Workbook()
+        # Default sheet "Sheet" → rename to Main; add Market.
+        main_ws = wb.active
+        main_ws.title = "Main"
+        market_ws = wb.create_sheet("Market")
+
+    _layout_main_sheet(main_ws)
+    _layout_market_sheet(market_ws)
+
+    # Seed Test mode = FALSE if blank (don't overwrite user choice).
+    if main_ws[MAIN_CELLS["TestMode"]].value is None:
+        main_ws[MAIN_CELLS["TestMode"]] = "FALSE"
+    if main_ws[MAIN_CELLS["Status"]].value is None:
+        main_ws[MAIN_CELLS["Status"]] = "(idle — never run)"
+
+    wb.save(path)
+    log.info(f"Workbook ready: {path.resolve()}")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument(
-        "--indexes", default="ALL",
-        help="Comma-separated: SP500,NIKKEI225,FTSE100,DAX,CAC40,BEL20 (default: ALL)",
-    )
-    parser.add_argument(
-        "--output", default=None,
-        help="Output xlsx path (default: stocks_report_YYYY-MM-DD.xlsx in current dir)",
-    )
-    parser.add_argument(
-        "--info-delay", type=float, default=0.25,
-        help="Seconds between yfinance .info calls to avoid rate limits (default: 0.25)",
-    )
-    args = parser.parse_args()
-
+def _cmd_legacy_run(args) -> int:
+    """Legacy single-shot mode: builds a fresh stocks_report_YYYY-MM-DD.xlsx."""
     if args.indexes.upper() == "ALL":
         indexes = list(INDEX_WIKI.keys())
     else:
@@ -712,6 +846,65 @@ def main() -> int:
     write_excel(df, fx, output)
     log.info(f"Done in {time.time() - t0:.0f}s. Rows: {len(df)}. Output: {output}")
     return 0
+
+
+def _cmd_init_workbook(args) -> int:
+    """Create or refresh stocks.xlsx with Main + Market sheet templates."""
+    init_workbook(Path(args.workbook))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd")
+
+    # init-workbook — create or refresh the persistent workbook
+    p_init = sub.add_parser(
+        "init-workbook",
+        help="Create or refresh stocks.xlsx with Main + Market sheet templates.",
+    )
+    p_init.add_argument(
+        "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
+        help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
+    )
+
+    # run — legacy single-shot all-in-one report (default when no subcommand)
+    p_run = sub.add_parser(
+        "run",
+        help="Legacy single-shot: write a fresh dated xlsx with everything.",
+    )
+    p_run.add_argument(
+        "--indexes", default="ALL",
+        help="Comma-separated: SP500,NIKKEI225,FTSE100,DAX,CAC40,BEL20,ESTOXX50 (default: ALL)",
+    )
+    p_run.add_argument(
+        "--output", default=None,
+        help="Output xlsx path (default: stocks_report_YYYY-MM-DD.xlsx in current dir)",
+    )
+    p_run.add_argument(
+        "--info-delay", type=float, default=0.25,
+        help="Seconds between yfinance .info calls (default: 0.25)",
+    )
+
+    # Legacy compat: when called as `stocks_report.py --indexes BEL20` with
+    # no subcommand, fall back to the run subparser. Detect by looking for
+    # a known top-level flag.
+    raw_args = sys.argv[1:]
+    if raw_args and raw_args[0] not in {"init-workbook", "run", "-h", "--help"}:
+        raw_args = ["run", *raw_args]
+    args = parser.parse_args(raw_args)
+
+    if args.cmd is None or args.cmd == "run":
+        # Provide defaults for legacy invocation (`stocks_report.py` with no args).
+        for attr, default in (("indexes", "ALL"), ("output", None), ("info_delay", 0.25)):
+            if not hasattr(args, attr):
+                setattr(args, attr, default)
+        return _cmd_legacy_run(args)
+    if args.cmd == "init-workbook":
+        return _cmd_init_workbook(args)
+
+    parser.print_help()
+    return 2
 
 
 if __name__ == "__main__":

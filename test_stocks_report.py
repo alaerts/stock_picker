@@ -9,9 +9,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stocks_report import (  # noqa: E402
+    MAIN_CELLS,
+    MARKET_COLUMNS,
     _extract_dataroma_tickers,
     _parse_bel20_ticker,
     aggregate_constituents,
+    init_workbook,
     normalize_ticker,
     price_at_or_before,
     to_eur,
@@ -140,6 +143,58 @@ def test_aggregate_constituents_empty_input():
     out = aggregate_constituents([])
     assert list(out.columns) == ["Symbol", "Name", "Indexes"]
     assert len(out) == 0
+
+
+# ---------------------------------------------------------------------------
+# init_workbook — creates Main + Market layout, idempotent
+# ---------------------------------------------------------------------------
+
+def test_init_workbook_creates_main_and_market(tmp_path):
+    """Fresh-create writes both sheets with the expected headers and named cells."""
+    from openpyxl import load_workbook
+    path = tmp_path / "stocks.xlsx"
+    init_workbook(path)
+    assert path.exists()
+    wb = load_workbook(path)
+    assert wb.sheetnames == ["Main", "Market"]
+    # Market headers match MARKET_COLUMNS
+    market = wb["Market"]
+    headers = [market.cell(row=1, column=i).value for i in range(1, len(MARKET_COLUMNS) + 1)]
+    assert headers == MARKET_COLUMNS
+    # Main has the title and named cells initialized
+    main = wb["Main"]
+    assert main["A1"].value == "Stock Picker"
+    assert main[MAIN_CELLS["TestMode"]].value == "FALSE"
+
+
+def test_init_workbook_is_idempotent(tmp_path):
+    """Running init twice does not clobber data the user added."""
+    from openpyxl import load_workbook
+    path = tmp_path / "stocks.xlsx"
+    init_workbook(path)
+
+    # User adds a portfolio entry and toggles test mode.
+    wb = load_workbook(path)
+    main = wb["Main"]
+    main["A5"] = "KBC.BR"     # portfolio symbol
+    main["B5"] = 10            # quantity
+    main[MAIN_CELLS["TestMode"]] = "TRUE"
+    market = wb["Market"]
+    market["A2"] = "FAKE.XX"   # pretend Market has data already
+    wb.save(path)
+
+    # Run init again — user data MUST survive.
+    init_workbook(path)
+    wb2 = load_workbook(path)
+    assert wb2["Main"]["A5"].value == "KBC.BR"
+    assert wb2["Main"]["B5"].value == 10
+    assert wb2["Main"][MAIN_CELLS["TestMode"]].value == "TRUE"
+    assert wb2["Market"]["A2"].value == "FAKE.XX"
+
+
+def test_init_workbook_market_columns_unique():
+    """No duplicate column names — otherwise lookups by name would be ambiguous."""
+    assert len(MARKET_COLUMNS) == len(set(MARKET_COLUMNS))
 
 
 # ---------------------------------------------------------------------------
