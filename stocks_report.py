@@ -826,6 +826,27 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 
 DEFAULT_WORKBOOK_PATH = Path("stocks.xlsx")
 
+# Where button-triggered errors land. Lives next to the workbook so the user
+# can find it without leaving Excel.
+ERROR_LOG_FILENAME = "stocks_errors.log"
+ERRORS_SHEET_NAME = "Errors"
+
+
+def _append_error_log(log_path: Path, exc_type: str, message: str, traceback_text: str) -> None:
+    """Append a timestamped block to the error log next to the workbook."""
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    block = (
+        "\n" + "=" * 70 + "\n"
+        f"{timestamp}  {exc_type}: {message}\n"
+        + "=" * 70 + "\n"
+        f"{traceback_text}\n"
+    )
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(block)
+    except Exception:
+        pass  # never let the error handler itself crash
+
 # Yahoo Finance quote URL template. Used to hyperlink each Market!Symbol cell.
 YAHOO_QUOTE_URL = "https://finance.yahoo.com/quote/{symbol}"
 
@@ -1214,6 +1235,57 @@ def _xw_status(main_sheet) -> Callable[[str], None]:
     return _set
 
 
+def _handle_button_exception(wb, job_name: str, exc: BaseException, traceback_text: str) -> None:
+    """Surface a button-triggered exception in three places:
+
+      * stocks_errors.log next to the workbook — full traceback, appended.
+      * an "Errors" sheet in the workbook — one row per error (timestamp,
+        job, exception, message, traceback).
+      * the Main!Status cell — concise summary + hint.
+
+    Never re-raises (caller already caught the exception); this swap of
+    the xlwings/VBA truncated MessageBox is the whole point of the wrapper.
+    """
+    exc_type = type(exc).__name__
+    message = str(exc)
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1. Log file next to workbook
+    try:
+        log_path = Path(wb.fullname).parent / ERROR_LOG_FILENAME
+        _append_error_log(log_path, exc_type, message, traceback_text)
+    except Exception:
+        pass
+
+    # 2. Errors sheet (create-if-missing, append a row)
+    try:
+        if ERRORS_SHEET_NAME not in [s.name for s in wb.sheets]:
+            err = wb.sheets.add(ERRORS_SHEET_NAME, after=wb.sheets[wb.sheets.count - 1])
+            err.range("A1").value = [[
+                "Timestamp (UTC)", "Job", "Exception", "Message", "Traceback",
+            ]]
+            err.range("A1:E1").api.Font.Bold = True
+        err = wb.sheets[ERRORS_SHEET_NAME]
+        # Find first empty row in column A
+        col_a = err.range("A:A")
+        last_used = col_a.api.SpecialCells(11).Row  # xlCellTypeLastCell
+        target_row = max(last_used + 1, 2)
+        err.range((target_row, 1)).value = [[
+            timestamp, job_name, exc_type, message[:500], traceback_text[:8000],
+        ]]
+    except Exception:
+        pass
+
+    # 3. Status cell — short summary + actionable hint
+    try:
+        wb.sheets["Main"].range(MAIN_CELLS["Status"]).value = (
+            f"ERROR ({timestamp[11:19]} UTC) — {exc_type}: {message[:120]} — "
+            f"see {ERROR_LOG_FILENAME} and the Errors sheet for the full traceback."
+        )[:240]
+    except Exception:
+        pass
+
+
 def _xw_read_portfolio(main_sheet) -> set[str]:
     out: set[str] = set()
     for r in range(PORTFOLIO_FIRST_ROW, PORTFOLIO_LAST_ROW + 1):
@@ -1237,6 +1309,7 @@ def _xw_read_test_mode(main_sheet) -> bool:
 
 def button_rebuild_inventory() -> None:
     """Entry point for the Excel "Rebuild Inventory" button."""
+    import traceback as _tb
     import xlwings as xw
     wb = xw.Book.caller()
     main = wb.sheets["Main"]
@@ -1321,12 +1394,14 @@ def button_rebuild_inventory() -> None:
         main.range(MAIN_CELLS["MarketRowCount"]).value = len(rows)
         status(f"rebuild: done. {len(rows)} rows at {now_iso}.")
     except Exception as e:
-        status(f"ERROR: {type(e).__name__}: {e}"[:200])
-        raise
+        _handle_button_exception(wb, "rebuild_inventory", e, _tb.format_exc())
+        # Do NOT re-raise — xlwings/VBA would otherwise show its truncated
+        # popup. The handler has surfaced the full traceback in 3 places.
 
 
 def button_get_quotes() -> None:
     """Entry point for the Excel "Get Quotes" button."""
+    import traceback as _tb
     import xlwings as xw
     wb = xw.Book.caller()
     main = wb.sheets["Main"]
@@ -1423,8 +1498,7 @@ def button_get_quotes() -> None:
 
         status(f"quotes: done. {ok} ok, {fail} failed at {now_iso}.")
     except Exception as e:
-        status(f"ERROR: {type(e).__name__}: {e}"[:200])
-        raise
+        _handle_button_exception(wb, "get_quotes", e, _tb.format_exc())
 
 
 # ---------------------------------------------------------------------------

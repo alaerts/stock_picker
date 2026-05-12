@@ -13,6 +13,7 @@ from stocks_report import (  # noqa: E402
     MAIN_CELLS,
     MARKET_COLUMNS,
     PORTFOLIO_FIRST_ROW,
+    _append_error_log,
     _extract_dataroma_tickers,
     _owned_for,
     _parse_bel20_ticker,
@@ -293,6 +294,41 @@ def test_init_workbook_preserves_user_cosmetic_edits(tmp_path):
 # ---------------------------------------------------------------------------
 # ETF list + get_etfs()
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _append_error_log — appends a timestamped block to the log file
+# ---------------------------------------------------------------------------
+
+def test_append_error_log_creates_file(tmp_path):
+    log = tmp_path / "stocks_errors.log"
+    _append_error_log(log, "RuntimeError", "boom", "Traceback line 1\nline 2\n")
+    text = log.read_text(encoding="utf-8")
+    assert "RuntimeError: boom" in text
+    assert "Traceback line 1" in text
+    assert "line 2" in text
+    # ISO timestamp prefix should be present
+    assert "T" in text and "Z" in text
+
+
+def test_append_error_log_appends_to_existing(tmp_path):
+    log = tmp_path / "stocks_errors.log"
+    _append_error_log(log, "ValueError", "first", "tb1\n")
+    _append_error_log(log, "TypeError", "second", "tb2\n")
+    text = log.read_text(encoding="utf-8")
+    # Both entries present
+    assert "ValueError: first" in text
+    assert "TypeError: second" in text
+    # Second is after first
+    assert text.index("first") < text.index("second")
+
+
+def test_append_error_log_swallows_io_errors(tmp_path):
+    """Log helper must never raise — its caller is already handling an
+    exception and a follow-on crash would mask the original error."""
+    # Pass a nonexistent parent directory; the call must NOT raise.
+    bogus = tmp_path / "no" / "such" / "dir" / "errors.log"
+    _append_error_log(bogus, "RuntimeError", "boom", "tb\n")  # should not raise
+
 
 def test_etf_list_has_one_per_index_plus_sector_and_country():
     """Sanity: 7 index ETFs + 11 sector ETFs + 19+ country ETFs."""
