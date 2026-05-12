@@ -85,12 +85,13 @@ INDEX_WIKI = {
     "DAX":       "https://en.wikipedia.org/wiki/DAX",
     "CAC40":     "https://en.wikipedia.org/wiki/CAC_40",
     "BEL20":     "https://en.wikipedia.org/wiki/BEL_20",
+    "ESTOXX50":  "https://en.wikipedia.org/wiki/EURO_STOXX_50",
 }
 
 # Native currency fallback if yfinance .info doesn't give us one.
 INDEX_DEFAULT_CCY = {
     "SP500": "USD", "NIKKEI225": "JPY", "FTSE100": "GBP",
-    "DAX": "EUR", "CAC40": "EUR", "BEL20": "EUR",
+    "DAX": "EUR", "CAC40": "EUR", "BEL20": "EUR", "ESTOXX50": "EUR",
 }
 
 # Watchlists: (display label, source, reference).
@@ -162,6 +163,11 @@ def normalize_ticker(symbol: str, index_name: str) -> str:
         if s.endswith(".BR") or s.endswith(".AS"):
             return s
         return s + ".BR"
+    if index_name == "ESTOXX50":
+        # Wikipedia's ESTOXX 50 table already lists fully-qualified Yahoo
+        # tickers (.DE / .PA / .AS / .MI / .MC / .HE / .IR), spanning multiple
+        # Eurozone exchanges. Pass through as-is.
+        return s
     return s
 
 # ---------------------------------------------------------------------------
@@ -210,7 +216,7 @@ def get_index_constituents(index_name: str) -> pd.DataFrame:
     resp.raise_for_status()
     tables = pd.read_html(io.StringIO(resp.text))
     expected_min = {"BEL20": 15, "CAC40": 30, "DAX": 30, "FTSE100": 80,
-                    "NIKKEI225": 150, "SP500": 400}.get(index_name, 10)
+                    "NIKKEI225": 150, "SP500": 400, "ESTOXX50": 45}.get(index_name, 10)
     found = _find_constituent_table(tables, expected_min)
     if not found:
         # Fallback: lower threshold

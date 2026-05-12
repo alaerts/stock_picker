@@ -35,6 +35,12 @@ from stocks_report import (  # noqa: E402
     # BEL 20
     ("KBC",      "BEL20",     "KBC.BR"),
     ("APAM.AS",  "BEL20",     "APAM.AS"),  # Amsterdam-listed, must not be re-suffixed
+    # EuroStoxx 50: Wikipedia provides fully-qualified Yahoo tickers — pass through
+    ("ADS.DE",   "ESTOXX50",  "ADS.DE"),
+    ("ADYEN.AS", "ESTOXX50",  "ADYEN.AS"),
+    ("AI.PA",    "ESTOXX50",  "AI.PA"),
+    ("ISP.MI",   "ESTOXX50",  "ISP.MI"),  # Milan
+    ("IBE.MC",   "ESTOXX50",  "IBE.MC"),  # Madrid
     # FTSE 100: trailing dot stripped, .L appended
     ("ULVR",     "FTSE100",   "ULVR.L"),
     ("RR.",      "FTSE100",   "RR.L"),
