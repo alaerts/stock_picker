@@ -18,6 +18,8 @@ from stocks_report import (  # noqa: E402
     _owned_for,
     _parse_bel20_ticker,
     _parse_nikkei225_components,
+    _pct_change,
+    _pct_column_pairs,
     _pick_test_target,
     aggregate_constituents,
     get_etfs,
@@ -381,6 +383,49 @@ def test_get_etfs_aggregates_with_index_data():
 ])
 def test_yahoo_quote_url(symbol, expected):
     assert yahoo_quote_url(symbol) == expected
+
+
+# ---------------------------------------------------------------------------
+# % change helpers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("today,past,expected", [
+    (110, 100, 0.10),       # +10%
+    (90,  100, -0.10),      # -10%
+    (100, 100, 0.0),
+    (100.5, 100, 0.005),
+    (None, 100, None),       # missing today
+    (100, None, None),       # missing past
+    (100, 0,   None),        # divide-by-zero
+    (100, "x", None),        # bad type
+])
+def test_pct_change(today, past, expected):
+    out = _pct_change(today, past)
+    if expected is None:
+        assert out is None
+    else:
+        assert out == pytest.approx(expected)
+
+
+def test_pct_column_pairs_covers_every_non_today_lookback():
+    """Exactly one (label, column_name) pair per lookback except Today."""
+    pairs = _pct_column_pairs()
+    expected_labels = ["1D ago", "1W ago", "1M ago", "6M ago", "1Y ago", "5Y ago"]
+    assert [lbl for lbl, _ in pairs] == expected_labels
+    # Each column name must exist in MARKET_COLUMNS so writes don't KeyError.
+    for _label, col in pairs:
+        assert col in MARKET_COLUMNS, f"{col!r} missing from MARKET_COLUMNS"
+
+
+def test_market_columns_includes_pct_columns_interleaved():
+    """After every '<X> ago (EUR)' column the next column must be '<X> %'."""
+    for i, name in enumerate(MARKET_COLUMNS):
+        if name.endswith(" ago (EUR)"):
+            label_short = name.replace(" ago (EUR)", "")
+            assert MARKET_COLUMNS[i + 1] == f"{label_short} %", (
+                f"After {name!r}, expected {label_short!r} %, got "
+                f"{MARKET_COLUMNS[i+1]!r}"
+            )
 
 
 def test_init_workbook_portfolio_header_has_no_quantity(tmp_path):

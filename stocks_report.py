@@ -872,31 +872,56 @@ def _resolve_workbook(arg_path: str) -> Path:
     return p
 
 # Market sheet column order. Fixed by index — every part of the code that
-# reads/writes Market locates columns by name via this list.
+# reads/writes Market locates columns by name via this list. % change
+# columns are interleaved with each price lookback so a row scan reads
+# "price | % change | price | % change | ..." across.
 MARKET_COLUMNS = [
     "Symbol", "Name", "Owned?", "Indexes", "Sector", "Watchlists", "Currency",
-    "Today (EUR)", "1D ago (EUR)", "1W ago (EUR)", "1M ago (EUR)",
-    "6M ago (EUR)", "1Y ago (EUR)", "5Y ago (EUR)",
+    "Today (EUR)",
+    "1D ago (EUR)", "1D %",
+    "1W ago (EUR)", "1W %",
+    "1M ago (EUR)", "1M %",
+    "6M ago (EUR)", "6M %",
+    "1Y ago (EUR)", "1Y %",
+    "5Y ago (EUR)", "5Y %",
     "P/E (TTM)", "Forward P/E",
     "Description", "Last update (UTC)", "Last error",
 ]
 
+# (lookback_label, percent_column_name) pairs derived from LOOKBACKS for the
+# get_quotes loop. Excludes "Today" since the % is relative to Today.
+def _pct_column_pairs() -> list[tuple[str, str]]:
+    return [(lbl, lbl.replace(" ago", "") + " %") for lbl in LOOKBACKS if lbl != "Today"]
+
+
+def _pct_change(today: Optional[float], past: Optional[float]) -> Optional[float]:
+    """Fractional change from ``past`` to ``today``. Returns None on bad inputs;
+    callers write the result with a percent number format."""
+    if today is None or past is None or past == 0:
+        return None
+    try:
+        return (float(today) - float(past)) / float(past)
+    except (TypeError, ValueError):
+        return None
+
 # Main sheet — named cells. All controls/metadata live ABOVE the portfolio
 # area so the portfolio can grow freely without colliding with them.
+# The Test-mode cell uses a ";;;" number format so the TRUE/FALSE the
+# checkbox writes is hidden — the checkbox is the visual indicator.
 MAIN_CELLS: dict[str, str] = {
-    "TestMode":       "B5",   # TRUE / FALSE
+    "TestMode":       "B5",   # TRUE / FALSE (display hidden; see init_workbook)
     "Status":         "B6",   # live progress text written during job runs
-    "LastRebuildAt":  "B9",
-    "LastQuotesAt":   "B10",
-    "MarketRowCount": "B11",
-    "EurUsd":         "B12",
-    "EurJpy":         "B13",
-    "EurGbp":         "B14",
+    "LastRebuildAt":  "B7",
+    "LastQuotesAt":   "B8",
+    "MarketRowCount": "B9",
+    "EurUsd":         "B10",
+    "EurJpy":         "B11",
+    "EurGbp":         "B12",
 }
 
 # Portfolio area on Main: header row + many rows for user entries.
-PORTFOLIO_HEADER_ROW = 17
-PORTFOLIO_FIRST_ROW = 18
+PORTFOLIO_HEADER_ROW = 15
+PORTFOLIO_FIRST_ROW = 16
 PORTFOLIO_LAST_ROW = 999  # plenty of room; never collides with controls above
 
 
@@ -943,24 +968,34 @@ def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     _set("A5", "Test mode (only refresh BEL20 + 1 quote):")
     _set("A6", "Status:")
 
-    _set("A8", "Metadata", bold=True, size=12)
-    _set("A9",  "Last rebuild_inventory:")
-    _set("A10", "Last get_quotes:")
-    _set("A11", "Total rows in Market:")
-    _set("A12", "EUR/USD (1 EUR = X USD):")
-    _set("A13", "EUR/JPY (1 EUR = X JPY):")
-    _set("A14", "EUR/GBP (1 EUR = X GBP):")
+    _set("A7",  "Last rebuild_inventory:")
+    _set("A8",  "Last get_quotes:")
+    _set("A9",  "Total rows in Market:")
+    _set("A10", "EUR/USD (1 EUR = X USD):")
+    _set("A11", "EUR/JPY (1 EUR = X JPY):")
+    _set("A12", "EUR/GBP (1 EUR = X GBP):")
 
-    _set("A16", "Portfolio (manual — list every Symbol you own)", bold=True, size=12)
+    _set("A14", "Portfolio (manual — list every Symbol you own)", bold=True, size=12)
 
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=1).coordinate, "Symbol", bold=True)
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=2).coordinate, "Notes", bold=True)
+
+    # Hide whatever value the TestMode cell holds (TRUE/FALSE the checkbox
+    # writes there). The cell still functions for read_test_mode; only its
+    # displayed text is suppressed. ";;;" is Excel's "hide all" number format.
+    ws[MAIN_CELLS["TestMode"]].number_format = ";;;"
 
     # Column widths: only reset on fresh creation (overwrite=True) to respect
     # any custom widths the user has set.
     if overwrite:
         ws.column_dimensions["A"].width = 38
         ws.column_dimensions["B"].width = 60
+
+
+# Excel's "Comma Style" (the ribbon button) accounting-style format.
+# Negative numbers shown with a leading minus + space alignment, zero as "-".
+COMMA_STYLE = '_-* #,##0.00_-;-* #,##0.00_-;_-* "-"??_-;_-@_-'
+PERCENT_STYLE = "0.00%"
 
 
 def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
@@ -986,6 +1021,7 @@ def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
             "Watchlists": 38, "Currency": 10,
             "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
             "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
+            "1D %": 9, "1W %": 9, "1M %": 9, "6M %": 9, "1Y %": 9, "5Y %": 9,
             "P/E (TTM)": 10, "Forward P/E": 10,
             "Description": 60, "Last update (UTC)": 20, "Last error": 30,
         }
@@ -1193,8 +1229,20 @@ def rebuild_inventory(
         market_ws.cell(row=row, column=cols["Sector"],      value=info.get("sector") or "")
         market_ws.cell(row=row, column=cols["Watchlists"],  value=", ".join(labels_dedup))
         market_ws.cell(row=row, column=cols["Currency"],    value=ccy)
-        market_ws.cell(row=row, column=cols["Description"], value=info.get("description") or "")
-        # Quote columns and Last update/error are left blank for get_quotes.
+        desc_cell = market_ws.cell(row=row, column=cols["Description"], value=info.get("description") or "")
+        # Force wrap text OFF on the Description cell — Excel sometimes
+        # auto-wraps long strings and the resulting tall rows are jarring.
+        desc_cell.alignment = Alignment(wrap_text=False)
+        # Pre-format the quote/PE cells so when get_quotes writes a value
+        # it'll render with thousand separators and 2 decimals out of the box.
+        for fmt_col in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)", "1M ago (EUR)",
+                        "6M ago (EUR)", "1Y ago (EUR)", "5Y ago (EUR)",
+                        "P/E (TTM)", "Forward P/E"):
+            market_ws.cell(row=row, column=cols[fmt_col]).number_format = COMMA_STYLE
+        # Pre-format the % cells with the percent style.
+        for _past_label, pct_col in _pct_column_pairs():
+            market_ws.cell(row=row, column=cols[pct_col]).number_format = PERCENT_STYLE
+        # Quote values and Last update/error are left blank for get_quotes.
 
     # Update Main metadata cells
     main_ws = wb["Main"]
@@ -1386,6 +1434,20 @@ def button_rebuild_inventory() -> None:
                     TextToDisplay=sym,
                 )
 
+            # Column-level formats — one COM call per range, applied to all
+            # data rows in one shot.
+            last_row = 1 + len(rows)
+            for fmt_col_name in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)",
+                                  "1M ago (EUR)", "6M ago (EUR)", "1Y ago (EUR)",
+                                  "5Y ago (EUR)", "P/E (TTM)", "Forward P/E"):
+                col_letter = get_column_letter(MARKET_COLUMNS.index(fmt_col_name) + 1)
+                market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = COMMA_STYLE
+            for _past_label, pct_col in _pct_column_pairs():
+                col_letter = get_column_letter(MARKET_COLUMNS.index(pct_col) + 1)
+                market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = PERCENT_STYLE
+            desc_letter = get_column_letter(MARKET_COLUMNS.index("Description") + 1)
+            market.range(f"{desc_letter}2:{desc_letter}{last_row}").api.WrapText = False
+
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         main.range(MAIN_CELLS["LastRebuildAt"]).value = now_iso
         main.range(MAIN_CELLS["MarketRowCount"]).value = len(rows)
@@ -1470,10 +1532,18 @@ def button_get_quotes() -> None:
         for (row_idx, sym, ccy, _idx) in targets:
             try:
                 series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
+                eur_by_label = {}
                 for label, delta in LOOKBACKS.items():
                     target_d = today - delta
                     native = price_at_or_before(series, target_d)
-                    market.range((row_idx, cols[f"{label} (EUR)"])).value = to_eur(native, ccy, fx)
+                    eur = to_eur(native, ccy, fx)
+                    eur_by_label[label] = eur
+                    market.range((row_idx, cols[f"{label} (EUR)"])).value = eur
+                today_eur = eur_by_label.get("Today")
+                for past_label, pct_col in _pct_column_pairs():
+                    rng = market.range((row_idx, cols[pct_col]))
+                    rng.value = _pct_change(today_eur, eur_by_label.get(past_label))
+                    rng.api.NumberFormat = PERCENT_STYLE
                 info = info_map.get(sym, {})
                 market.range((row_idx, cols["P/E (TTM)"])).value   = info.get("trailingPE")
                 market.range((row_idx, cols["Forward P/E"])).value = info.get("forwardPE")
@@ -1615,11 +1685,21 @@ def get_quotes(
     for (row_idx, sym, ccy, _indexes) in targets:
         try:
             series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
+            eur_by_label: dict[str, Optional[float]] = {}
             for label, delta in LOOKBACKS.items():
                 target = today - delta
                 native = price_at_or_before(series, target)
-                market_ws.cell(row=row_idx, column=cols[f"{label} (EUR)"],
-                               value=to_eur(native, ccy, fx))
+                eur = to_eur(native, ccy, fx)
+                eur_by_label[label] = eur
+                market_ws.cell(row=row_idx, column=cols[f"{label} (EUR)"], value=eur)
+            # % change vs Today for each non-Today lookback
+            today_eur = eur_by_label.get("Today")
+            for past_label, pct_col in _pct_column_pairs():
+                cell = market_ws.cell(
+                    row=row_idx, column=cols[pct_col],
+                    value=_pct_change(today_eur, eur_by_label.get(past_label)),
+                )
+                cell.number_format = PERCENT_STYLE
             info = info_map.get(sym, {})
             market_ws.cell(row=row_idx, column=cols["P/E (TTM)"],   value=info.get("trailingPE"))
             market_ws.cell(row=row_idx, column=cols["Forward P/E"], value=info.get("forwardPE"))
