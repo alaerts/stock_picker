@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stocks_report import (  # noqa: E402
     _extract_dataroma_tickers,
     _parse_bel20_ticker,
+    aggregate_constituents,
     normalize_ticker,
     price_at_or_before,
     to_eur,
@@ -93,6 +94,46 @@ def test_extract_dataroma_tickers_empty_on_no_match():
 def test_extract_dataroma_tickers_ignores_unrelated_links():
     html = '<a href="/m/managers.php">Managers</a> <a href="/m/stock.php?sym=AAPL">AAPL</a>'
     assert _extract_dataroma_tickers(html) == {"AAPL"}
+
+
+# ---------------------------------------------------------------------------
+# aggregate_constituents — dedups by Symbol, joins Indexes
+# ---------------------------------------------------------------------------
+
+def _df(rows):
+    return pd.DataFrame(rows, columns=["Symbol", "Name", "Index"])
+
+
+def test_aggregate_constituents_dedups_by_symbol():
+    """A stock in two indexes yields one row with both indexes listed."""
+    dax = _df([("SAP.DE", "SAP", "DAX"), ("ALV.DE", "Allianz", "DAX")])
+    estoxx = _df([("SAP.DE", "SAP SE", "ESTOXX50"), ("AIR.PA", "Airbus", "ESTOXX50")])
+    out = aggregate_constituents([dax, estoxx])
+    rows = {r["Symbol"]: r for _, r in out.iterrows()}
+    assert rows["SAP.DE"]["Indexes"] == "DAX, ESTOXX50"
+    assert rows["ALV.DE"]["Indexes"] == "DAX"
+    assert rows["AIR.PA"]["Indexes"] == "ESTOXX50"
+    assert len(out) == 3  # SAP collapsed into one row
+
+
+def test_aggregate_constituents_preserves_first_seen_name():
+    dax = _df([("SAP.DE", "SAP", "DAX")])
+    estoxx = _df([("SAP.DE", "SAP SE", "ESTOXX50")])  # different Name spelling
+    out = aggregate_constituents([dax, estoxx])
+    assert out.iloc[0]["Name"] == "SAP"  # DAX listed first → its Name wins
+
+
+def test_aggregate_constituents_dedups_repeated_index():
+    """Defensive: if the same Symbol+Index appears twice, Indexes lists it once."""
+    a = _df([("AAPL", "Apple", "SP500"), ("AAPL", "Apple", "SP500")])
+    out = aggregate_constituents([a])
+    assert out.iloc[0]["Indexes"] == "SP500"
+
+
+def test_aggregate_constituents_empty_input():
+    out = aggregate_constituents([])
+    assert list(out.columns) == ["Symbol", "Name", "Indexes"]
+    assert len(out) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -526,10 +526,42 @@ def price_at_or_before(series: pd.Series, target: dt.date) -> Optional[float]:
 # Report assembly
 # ---------------------------------------------------------------------------
 
+def aggregate_constituents(per_index: list[pd.DataFrame]) -> pd.DataFrame:
+    """Combine per-index constituent DataFrames into one row per Symbol.
+
+    Input rows: ``[Symbol, Name, Index]`` (one row per Symbol per Index).
+    Output rows: ``[Symbol, Name, Indexes]`` where Indexes is a comma-separated
+    list preserving the order in which indexes were fetched. A stock appearing
+    in DAX and EuroStoxx 50 yields one row with ``Indexes = "DAX, ESTOXX50"``.
+    """
+    if not per_index:
+        return pd.DataFrame(columns=["Symbol", "Name", "Indexes"])
+    combined = pd.concat(per_index, ignore_index=True)
+    if combined.empty:
+        return pd.DataFrame(columns=["Symbol", "Name", "Indexes"])
+
+    # Preserve first-seen Name for each Symbol.
+    name_map = combined.drop_duplicates(subset=["Symbol"], keep="first").set_index("Symbol")["Name"]
+    # Aggregate indexes per Symbol, preserving order, deduping.
+    def _join_unique(seq):
+        seen = []
+        for x in seq:
+            if x not in seen:
+                seen.append(x)
+        return ", ".join(seen)
+    indexes_map = combined.groupby("Symbol", sort=False)["Index"].apply(_join_unique)
+
+    out = pd.DataFrame({
+        "Symbol":  indexes_map.index,
+        "Name":    [name_map.get(s, "") for s in indexes_map.index],
+        "Indexes": indexes_map.values,
+    })
+    return out.reset_index(drop=True)
+
+
 def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, dict]:
-    # 1. constituents
-    parts = [get_index_constituents(idx) for idx in indexes]
-    constituents = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["Symbol"])
+    # 1. constituents — one row per Symbol with all index memberships joined
+    constituents = aggregate_constituents([get_index_constituents(idx) for idx in indexes])
     log.info(f"Total unique tickers: {len(constituents)}")
 
     # 2. watchlist memberships
@@ -553,11 +585,14 @@ def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, d
     for _, c in constituents.iterrows():
         sym = c["Symbol"]
         info = info_map.get(sym, {})
-        ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(c["Index"], "")
+        # Pick the first listed index as the currency fallback (their default
+        # currencies disagree only across regions; intersection cases are EUR-EUR).
+        first_index = c["Indexes"].split(",")[0].strip()
+        ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(first_index, "")
         series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
 
         row = {
-            "Index":    c["Index"],
+            "Indexes":  c["Indexes"],
             "Symbol":   sym,
             "Name":     info.get("longName") or c["Name"],
             "Currency": ccy,
@@ -575,7 +610,6 @@ def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, d
         labels: list[str] = []
         for key in {sym, sym_root}:
             labels.extend(wl_membership.get(key, []))
-        # Dedupe while preserving order
         seen = set()
         labels_dedup = [x for x in labels if not (x in seen or seen.add(x))]
         row["Watchlists"] = ", ".join(labels_dedup)
