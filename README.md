@@ -63,13 +63,46 @@ uv pip install -r requirements.txt --python .venv\Scripts\python.exe
 
 # 5. In Excel: open stocks.xlsm, press Alt+F11, File -> Import File ->
 #    select vba\stocks_picker.bas, save. Buttons now work.
+
+# 6. Still in the VBA editor: Tools -> References -> tick "xlwings" -> OK.
+#    Without this the macros compile-error with "Sub or Function not
+#    defined" on RunPython (the symbol lives in the xlwings add-in and
+#    each workbook's VBA project needs its own reference).
 ```
 
 Optional polish (one-time):
 - Right-click each button → **Edit Text** to confirm labels read "Rebuild
   Inventory" and "Get Quotes".
-- In Main!B5, change the value to TRUE to enter test mode; FALSE for full
-  runs. (Or use the `--test` CLI flag.)
+- Use the Test-mode checkbox on Main to toggle between BEL20-only smoke
+  runs (~1 min) and the full universe (~10 min). Or use the `--test` CLI
+  flag on either subcommand.
+
+## Troubleshooting
+
+**`'python' is not recognized`** — there's no plain `python` on PATH.
+From cmd.exe: `.venv\Scripts\python.exe stocks_report.py ...` (or run
+`.venv\Scripts\activate.bat` first, then `python` works for the session).
+From PowerShell: `.\.venv\Scripts\python.exe stocks_report.py ...`.
+
+**`Sub or Function not defined` on `RunPython` when clicking a button** —
+the workbook's VBA project is missing its reference to the xlwings add-in.
+Open the VBA editor (Alt+F11), **Tools → References**, tick **xlwings**.
+If "xlwings" doesn't appear there, the add-in itself isn't loaded:
+**File → Options → Add-ins → Manage: Excel Add-ins → Go** and tick
+**xlwings**. Restart Excel afterwards if needed. This reference is
+per-workbook; recreating `stocks.xlsm` from scratch means redoing
+this one-time step.
+
+**Truncated error popup** — shouldn't happen any more. Button-triggered
+failures land in three places: `stocks_errors.log` next to the workbook
+(full traceback, append-only), the `Errors` sheet inside the workbook
+(one row per failure), and the `Main!Status` cell (concise summary).
+If you're still seeing a truncated VBA MsgBox, the `button_*` functions
+in `stocks_report.py` lost their `try/except` wrapper — check the source.
+
+**`xlwings addin install` says "No module named xlwings.__main__"** —
+xlwings doesn't ship a `__main__`. Use the installed console script:
+`.\.venv\Scripts\xlwings.exe addin install` (not `python -m xlwings`).
 
 ## Day-to-day usage
 
