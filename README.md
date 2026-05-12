@@ -59,7 +59,7 @@ uv pip install -r requirements.txt --python .venv\Scripts\python.exe
 .\.venv\Scripts\python.exe stocks_report.py setup-buttons
 
 # 4. Install the xlwings Excel add-in (once per machine).
-.\.venv\Scripts\python.exe -m xlwings addin install
+.\.venv\Scripts\xlwings.exe addin install
 
 # 5. In Excel: open stocks.xlsm, press Alt+F11, File -> Import File ->
 #    select vba\stocks_picker.bas, save. Buttons now work.

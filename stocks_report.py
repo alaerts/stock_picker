@@ -1509,7 +1509,7 @@ def _cmd_setup_buttons(args) -> int:
         log.info("  2. Press Alt+F11 -> File -> Import File -> select vba/stocks_picker.bas.")
         log.info("  3. Save (the buttons will now respond to clicks).")
         log.info("")
-        log.info("Also run once: `xlwings addin install` (from any terminal).")
+        log.info(r"Also run once: `.\.venv\Scripts\xlwings.exe addin install`")
         return 0
     finally:
         app.quit()
