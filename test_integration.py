@@ -17,7 +17,9 @@ import pytest
 
 from stocks_report import (
     DATAROMA_ACTIVIST_CODES,
+    ETF_LIST,
     INDEX_WIKI,
+    fetch_close_prices,
     fetch_dataroma_activist_aggregate,
     fetch_dataroma_tickers,
     fetch_yahoo_screener,
@@ -166,6 +168,28 @@ def test_dataroma_activist_aggregate_covers_all_seven_managers():
     assert len(tickers) >= 40, (
         f"Activist aggregate returned {len(tickers)} (expected ~80+). "
         f"One or more of {DATAROMA_ACTIVIST_CODES} may be invalid."
+    )
+
+
+# ---------------------------------------------------------------------------
+# ETFs — yfinance has price history for each curated ticker
+# ---------------------------------------------------------------------------
+
+def test_etf_tickers_resolve_on_yahoo():
+    """Bulk-download last week of prices for every ETF in ETF_LIST. Any
+    ticker that doesn't resolve on Yahoo (typo, delisted, renamed) won't
+    appear in the returned columns and we surface it as a failure."""
+    import datetime as dt
+    tickers = [sym for sym, _, _ in ETF_LIST]
+    end = dt.date.today() + dt.timedelta(days=1)
+    start = end - dt.timedelta(days=14)
+    closes = fetch_close_prices(tickers, start, end)
+    missing = [t for t in tickers if t not in closes.columns]
+    # Allow a small failure budget — Yahoo occasionally drops a ticker for
+    # a session. Hard-fail if more than ~10% are missing.
+    assert len(missing) <= max(2, len(tickers) // 10), (
+        f"{len(missing)}/{len(tickers)} ETF tickers did not resolve on Yahoo: "
+        f"{missing}. Curated list may need updating."
     )
 
 

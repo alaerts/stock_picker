@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stocks_report import (  # noqa: E402
+    ETF_LIST,
     MAIN_CELLS,
     MARKET_COLUMNS,
     PORTFOLIO_FIRST_ROW,
@@ -18,6 +19,7 @@ from stocks_report import (  # noqa: E402
     _parse_nikkei225_components,
     _pick_test_target,
     aggregate_constituents,
+    get_etfs,
     init_workbook,
     normalize_ticker,
     price_at_or_before,
@@ -286,6 +288,51 @@ def test_init_workbook_preserves_user_cosmetic_edits(tmp_path):
     assert wb2["Main"]["A1"].value == "Patrick's Stock Picker"
     assert wb2["Main"]["A3"].value == "My Custom Jobs Section"
     assert wb2["Main"].column_dimensions["A"].width == 100
+
+
+# ---------------------------------------------------------------------------
+# ETF list + get_etfs()
+# ---------------------------------------------------------------------------
+
+def test_etf_list_has_one_per_index_plus_sector_and_country():
+    """Sanity: 7 index ETFs + 11 sector ETFs + 19+ country ETFs."""
+    assert len(ETF_LIST) >= 30, f"ETF_LIST shrank to {len(ETF_LIST)}; was 37+"
+    labels = [label for _, _, label in ETF_LIST]
+    # Must cover every tracked index
+    for idx in ("SP500", "NIKKEI225", "FTSE100", "DAX", "CAC40", "BEL20", "ESTOXX50"):
+        assert any(f"ETF — {idx}" == lbl for lbl in labels), f"No ETF for {idx}"
+    # Must have at least one sector ETF labelled "Utilities" (user explicitly named it)
+    assert any("Sector: Utilities" in lbl for lbl in labels)
+    # Must have several country ETFs
+    country_count = sum(1 for lbl in labels if lbl.startswith("ETF — Country:"))
+    assert country_count >= 15
+
+
+def test_etf_tickers_are_unique():
+    tickers = [sym for sym, _, _ in ETF_LIST]
+    assert len(tickers) == len(set(tickers)), "Duplicate ETF tickers"
+
+
+def test_get_etfs_returns_constituent_shape():
+    df = get_etfs()
+    assert list(df.columns) == ["Symbol", "Name", "Index"]
+    assert len(df) == len(ETF_LIST)
+    # Every row's Index label starts with "ETF — "
+    assert df["Index"].str.startswith("ETF —").all()
+
+
+def test_get_etfs_aggregates_with_index_data():
+    """ETFs flow through aggregate_constituents alongside index DataFrames."""
+    import pandas as pd
+    index_df = pd.DataFrame(
+        [("AAPL", "Apple", "SP500"), ("KBC.BR", "KBC", "BEL20")],
+        columns=["Symbol", "Name", "Index"],
+    )
+    combined = aggregate_constituents([index_df, get_etfs()])
+    syms = set(combined["Symbol"])
+    assert "AAPL" in syms
+    assert "SPY" in syms  # known ETF
+    assert "XLU" in syms  # the Utilities sector ETF specifically
 
 
 @pytest.mark.parametrize("symbol,expected", [

@@ -96,6 +96,70 @@ INDEX_DEFAULT_CCY = {
     "DAX": "EUR", "CAC40": "EUR", "BEL20": "EUR", "ESTOXX50": "EUR",
 }
 
+# ETFs to surface in Market alongside the index constituents. Curated;
+# Yahoo tickers are stable so this list rarely needs touching.
+# Schema: (Yahoo ticker, display name, label-for-the-Indexes-column).
+ETF_LIST: list[tuple[str, str, str]] = [
+    # One per tracked index — gives a single-line proxy for each universe.
+    ("SPY",   "SPDR S&P 500 ETF Trust",                          "ETF — SP500"),
+    ("EWJ",   "iShares MSCI Japan ETF",                          "ETF — NIKKEI225"),
+    ("EWU",   "iShares MSCI United Kingdom ETF",                 "ETF — FTSE100"),
+    ("EWG",   "iShares MSCI Germany ETF",                        "ETF — DAX"),
+    ("EWQ",   "iShares MSCI France ETF",                         "ETF — CAC40"),
+    ("EWK",   "iShares MSCI Belgium ETF",                        "ETF — BEL20"),
+    ("FEZ",   "SPDR EURO STOXX 50 ETF",                          "ETF — ESTOXX50"),
+    # One per GICS sector (US Select Sector SPDR funds).
+    ("XLE",   "Energy Select Sector SPDR Fund",                  "ETF — Sector: Energy"),
+    ("XLB",   "Materials Select Sector SPDR Fund",               "ETF — Sector: Materials"),
+    ("XLI",   "Industrial Select Sector SPDR Fund",              "ETF — Sector: Industrials"),
+    ("XLY",   "Consumer Discretionary Select Sector SPDR Fund",  "ETF — Sector: Consumer Discretionary"),
+    ("XLP",   "Consumer Staples Select Sector SPDR Fund",        "ETF — Sector: Consumer Staples"),
+    ("XLV",   "Health Care Select Sector SPDR Fund",             "ETF — Sector: Healthcare"),
+    ("XLF",   "Financial Select Sector SPDR Fund",               "ETF — Sector: Financials"),
+    ("XLK",   "Technology Select Sector SPDR Fund",              "ETF — Sector: Technology"),
+    ("XLC",   "Communication Services Select Sector SPDR Fund",  "ETF — Sector: Communication Services"),
+    ("XLU",   "Utilities Select Sector SPDR Fund",               "ETF — Sector: Utilities"),
+    ("XLRE",  "Real Estate Select Sector SPDR Fund",             "ETF — Sector: Real Estate"),
+    # One per semi-large country (iShares MSCI single-country funds).
+    ("EWN",   "iShares MSCI Netherlands ETF",                    "ETF — Country: Netherlands"),
+    ("EWI",   "iShares MSCI Italy ETF",                          "ETF — Country: Italy"),
+    ("EWP",   "iShares MSCI Spain ETF",                          "ETF — Country: Spain"),
+    ("EWL",   "iShares MSCI Switzerland ETF",                    "ETF — Country: Switzerland"),
+    ("EWD",   "iShares MSCI Sweden ETF",                         "ETF — Country: Sweden"),
+    ("ENOR",  "iShares MSCI Norway ETF",                         "ETF — Country: Norway"),
+    ("EDEN",  "iShares MSCI Denmark ETF",                        "ETF — Country: Denmark"),
+    ("EFNL",  "iShares MSCI Finland ETF",                        "ETF — Country: Finland"),
+    ("EIRL",  "iShares MSCI Ireland ETF",                        "ETF — Country: Ireland"),
+    ("EWO",   "iShares MSCI Austria ETF",                        "ETF — Country: Austria"),
+    ("EPOL",  "iShares MSCI Poland ETF",                         "ETF — Country: Poland"),
+    ("EWA",   "iShares MSCI Australia ETF",                      "ETF — Country: Australia"),
+    ("EWC",   "iShares MSCI Canada ETF",                         "ETF — Country: Canada"),
+    ("EWZ",   "iShares MSCI Brazil ETF",                         "ETF — Country: Brazil"),
+    ("INDA",  "iShares MSCI India ETF",                          "ETF — Country: India"),
+    ("EWT",   "iShares MSCI Taiwan ETF",                         "ETF — Country: Taiwan"),
+    ("EWY",   "iShares MSCI South Korea ETF",                    "ETF — Country: South Korea"),
+    ("EZA",   "iShares MSCI South Africa ETF",                   "ETF — Country: South Africa"),
+    ("EWW",   "iShares MSCI Mexico ETF",                         "ETF — Country: Mexico"),
+    ("MCHI",  "iShares MSCI China ETF",                          "ETF — Country: China"),
+]
+
+
+def get_etfs() -> pd.DataFrame:
+    """Return ETF rows shaped like a get_index_constituents() result.
+
+    Schema: ``[Symbol, Name, Index]`` — Index is the per-ETF label so each
+    ETF surfaces a distinct "Indexes" tag in Market (e.g. "ETF — Sector:
+    Utilities"). They flow through aggregate_constituents alongside the
+    real index constituents.
+    """
+    log.info(f"Adding {len(ETF_LIST)} curated ETFs")
+    df = pd.DataFrame(
+        [(sym, name, label) for sym, name, label in ETF_LIST],
+        columns=["Symbol", "Name", "Index"],
+    )
+    return df
+
+
 # Watchlists: (display label, source, reference).
 # Sources:
 #   "yahoo_screener"     → ref is a Yahoo predefined screener scrIds value.
@@ -640,8 +704,11 @@ def aggregate_constituents(per_index: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, dict]:
-    # 1. constituents — one row per Symbol with all index memberships joined
-    constituents = aggregate_constituents([get_index_constituents(idx) for idx in indexes])
+    # 1. constituents — one row per Symbol with all index memberships joined,
+    #    plus the curated ETF set (one row per ETF).
+    parts = [get_index_constituents(idx) for idx in indexes]
+    parts.append(get_etfs())
+    constituents = aggregate_constituents(parts)
     log.info(f"Total unique tickers: {len(constituents)}")
 
     # 2. watchlist memberships
@@ -1056,8 +1123,10 @@ def rebuild_inventory(
     _say(f"  Portfolio entries: {len(portfolio)}")
 
     _say("Fetching index constituents")
-    constituents = aggregate_constituents([get_index_constituents(idx) for idx in indexes])
-    _say(f"  Total unique tickers: {len(constituents)}")
+    parts = [get_index_constituents(idx) for idx in indexes]
+    parts.append(get_etfs())
+    constituents = aggregate_constituents(parts)
+    _say(f"  Total unique tickers (incl. ETFs): {len(constituents)}")
 
     _say("Fetching watchlists")
     wl_membership = fetch_all_watchlists()
@@ -1183,8 +1252,10 @@ def button_rebuild_inventory() -> None:
         status(f"Portfolio entries: {len(portfolio)}")
 
         status("Fetching index constituents…")
-        constituents = aggregate_constituents([get_index_constituents(idx) for idx in indexes])
-        status(f"Total unique tickers: {len(constituents)}")
+        parts = [get_index_constituents(idx) for idx in indexes]
+        parts.append(get_etfs())
+        constituents = aggregate_constituents(parts)
+        status(f"Total unique tickers (incl. ETFs): {len(constituents)}")
 
         status("Fetching watchlists…")
         wl_membership = fetch_all_watchlists()
