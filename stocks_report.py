@@ -485,17 +485,23 @@ def fetch_close_prices(tickers: list[str], start: dt.date, end: dt.date,
     return combined
 
 def fetch_ticker_info(ticker: str) -> dict:
-    """Returns {currency, trailingPE, forwardPE, longName}. Best-effort."""
+    """Returns currency, P/E, name, sector, and business description. Best-effort.
+
+    All fields come from a single ``yf.Ticker(t).info`` call, so adding sector
+    and description has zero extra cost over fetching P/E.
+    """
     try:
         info = yf.Ticker(ticker).info or {}
     except Exception as e:
         log.debug(f"info('{ticker}') raised: {e}")
         info = {}
     return {
-        "currency":   info.get("currency") or "",
-        "trailingPE": info.get("trailingPE"),
-        "forwardPE":  info.get("forwardPE"),
-        "longName":   info.get("longName") or info.get("shortName") or "",
+        "currency":    info.get("currency") or "",
+        "trailingPE":  info.get("trailingPE"),
+        "forwardPE":   info.get("forwardPE"),
+        "longName":    info.get("longName") or info.get("shortName") or "",
+        "sector":      info.get("sector") or "",
+        "description": info.get("longBusinessSummary") or "",
     }
 
 def fetch_all_info(tickers: list[str], delay: float = 0.25) -> dict[str, dict]:
@@ -601,6 +607,7 @@ def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, d
             "Indexes":  c["Indexes"],
             "Symbol":   sym,
             "Name":     info.get("longName") or c["Name"],
+            "Sector":   info.get("sector") or "",
             "Currency": ccy,
         }
         for label, delta in LOOKBACKS.items():
@@ -618,7 +625,8 @@ def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, d
             labels.extend(wl_membership.get(key, []))
         seen = set()
         labels_dedup = [x for x in labels if not (x in seen or seen.add(x))]
-        row["Watchlists"] = ", ".join(labels_dedup)
+        row["Watchlists"]  = ", ".join(labels_dedup)
+        row["Description"] = info.get("description") or ""
 
         rows.append(row)
 
