@@ -21,6 +21,7 @@ from stocks_report import (  # noqa: E402
     normalize_ticker,
     price_at_or_before,
     read_portfolio_symbols,
+    read_test_mode,
     to_eur,
 )
 
@@ -262,6 +263,37 @@ def test_pick_test_target_falls_back_to_first_row_if_no_bel20():
 
 def test_pick_test_target_returns_none_when_market_empty():
     assert _pick_test_target([], set()) is None
+
+
+# ---------------------------------------------------------------------------
+# read_test_mode — Main!B5 cell interpretation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    ("TRUE",  True),
+    ("True",  True),
+    ("true",  True),
+    ("Yes",   True),
+    ("Y",     True),
+    ("1",     True),
+    (1,       True),
+    (True,    True),
+    ("FALSE", False),
+    ("No",    False),
+    ("0",     False),
+    (0,       False),
+    (False,   False),
+    ("",      False),
+    (None,    False),
+    ("  TRUE  ", True),  # whitespace tolerated
+])
+def test_read_test_mode_interpretation(raw, expected):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Main"
+    ws[MAIN_CELLS["TestMode"]] = raw
+    assert read_test_mode(ws) is expected
 
 
 def test_read_portfolio_symbols_ignores_main_section_labels(tmp_path):

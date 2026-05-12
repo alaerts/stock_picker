@@ -813,6 +813,24 @@ def _market_col(name: str) -> int:
     return MARKET_COLUMNS.index(name) + 1
 
 
+_TEST_MODE_TRUTHY = {"TRUE", "T", "YES", "Y", "1"}
+
+
+def read_test_mode(main_ws: Worksheet) -> bool:
+    """Interpret the Main!TestMode cell as a boolean.
+
+    Tolerates the cell being TRUE/FALSE strings (default seed), a literal
+    Python bool (some xlwings paths return that), 1/0, "Yes"/"No", or blank
+    (treated as False).
+    """
+    raw = main_ws[MAIN_CELLS["TestMode"]].value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().upper() in _TEST_MODE_TRUTHY
+
+
 def read_portfolio_symbols(main_ws: Worksheet) -> set[str]:
     """Read the Main sheet's manual portfolio area, returning normalized symbols."""
     out: set[str] = set()
@@ -887,11 +905,14 @@ def rebuild_inventory(
     indexes: Optional[list[str]] = None,
     info_delay: float = 0.25,
     status: Optional[Callable[[str], None]] = None,
+    test_mode: Optional[bool] = None,
 ) -> int:
     """Rebuild the Market sheet from scratch. Preserves Main (portfolio + cells)
     other than the metadata cells this job owns.
 
     ``indexes``: subset of INDEX_WIKI keys; defaults to all.
+    ``test_mode``: True / False / None. When None, reads Main!TestMode cell.
+                   When True, restricts to BEL20 regardless of ``indexes``.
     ``status``: optional one-arg callback for live progress text (Phase 8
                 wires this to Main!Status via xlwings; CLI mode passes None
                 and progress goes to the log instead).
@@ -909,12 +930,18 @@ def rebuild_inventory(
             except Exception as e:
                 log.debug(f"status callback raised: {e}")
 
-    indexes = indexes or list(INDEX_WIKI.keys())
     t0 = time.time()
-    _say(f"rebuild_inventory: starting ({', '.join(indexes)})")
-
     _say("Reading portfolio from Main")
     wb = load_workbook(workbook_path)
+    if test_mode is None:
+        test_mode = read_test_mode(wb["Main"])
+    if test_mode:
+        indexes = ["BEL20"]
+        _say("Test mode ON — BEL20 only")
+    elif indexes is None:
+        indexes = list(INDEX_WIKI.keys())
+    _say(f"rebuild_inventory: starting ({', '.join(indexes)})")
+
     portfolio = read_portfolio_symbols(wb["Main"])
     _say(f"  Portfolio entries: {len(portfolio)}")
 
@@ -1025,14 +1052,15 @@ def _pick_test_target(
 
 def get_quotes(
     workbook_path: Path,
-    test_mode: bool = False,
+    test_mode: Optional[bool] = None,
     info_delay: float = 0.25,
     status: Optional[Callable[[str], None]] = None,
 ) -> int:
     """Refresh quote columns in Market for every Symbol (or one in test mode).
 
     Sets per-row "Last update (UTC)" on success and "Last error" on failure;
-    successful refresh clears any previous error.
+    successful refresh clears any previous error. ``test_mode=None`` reads
+    Main!TestMode from the workbook.
     """
     workbook_path = Path(workbook_path)
     if not workbook_path.exists():
@@ -1048,11 +1076,13 @@ def get_quotes(
                 log.debug(f"status callback raised: {e}")
 
     t0 = time.time()
-    _say(f"get_quotes: starting (test_mode={test_mode})")
-
     wb = load_workbook(workbook_path)
     main_ws = wb["Main"]
     market_ws = wb["Market"]
+    if test_mode is None:
+        test_mode = read_test_mode(main_ws)
+    _say(f"get_quotes: starting (test_mode={test_mode})")
+
     portfolio = read_portfolio_symbols(main_ws)
     market_rows = _read_market_symbols(market_ws)
 
@@ -1163,19 +1193,19 @@ def _cmd_init_workbook(args) -> int:
 
 def _cmd_get_quotes(args) -> int:
     """Job 2 — refresh quote columns (prices + P/E) for every Market row."""
+    # --test forces test mode; without it, the workbook's TestMode cell decides.
     return get_quotes(
         workbook_path=Path(args.workbook),
-        test_mode=args.test,
+        test_mode=True if args.test else None,
         info_delay=args.info_delay,
     )
 
 
 def _cmd_rebuild_inventory(args) -> int:
     """Job 1 — refresh the Market sheet structural data (no quotes)."""
+    # --test forces BEL20 only; without it, the workbook's TestMode cell decides.
     indexes = None
-    if args.test:
-        indexes = ["BEL20"]  # test mode is a one-index smoke
-    elif args.indexes and args.indexes.upper() != "ALL":
+    if not args.test and args.indexes and args.indexes.upper() != "ALL":
         indexes = [s.strip().upper() for s in args.indexes.split(",")]
         unknown = [i for i in indexes if i not in INDEX_WIKI]
         if unknown:
@@ -1186,6 +1216,7 @@ def _cmd_rebuild_inventory(args) -> int:
         workbook_path=Path(args.workbook),
         indexes=indexes,
         info_delay=args.info_delay,
+        test_mode=True if args.test else None,
     )
 
 
