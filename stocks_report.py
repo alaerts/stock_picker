@@ -951,16 +951,19 @@ def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     def _set(addr: str, value, *, bold: bool = False, size: int = 11,
              italic: bool = False, color: Optional[str] = None) -> None:
         cell = ws[addr]
-        if overwrite or cell.value is None:
-            cell.value = value
-        # Style only when the value matches what we just wrote — leaves
-        # user-edited labels with their own styling.
-        if cell.value == value:
-            font_kwargs = {"size": size}
-            if bold: font_kwargs["bold"] = True
-            if italic: font_kwargs["italic"] = True
-            if color: font_kwargs["color"] = color
-            cell.font = Font(**font_kwargs)
+        if not overwrite:
+            # Re-run path: never touch the cell. This respects three kinds of
+            # user edits: renames (value changed), clearances (value cleared
+            # to None), and bespoke styling. The trade-off is that new labels
+            # we add in future versions of the code won't appear in old
+            # workbooks unless the user deletes the file.
+            return
+        cell.value = value
+        font_kwargs = {"size": size}
+        if bold: font_kwargs["bold"] = True
+        if italic: font_kwargs["italic"] = True
+        if color: font_kwargs["color"] = color
+        cell.font = Font(**font_kwargs)
 
     _set("A1", "Stock Picker", bold=True, size=16)
 
@@ -980,14 +983,12 @@ def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=1).coordinate, "Symbol", bold=True)
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=2).coordinate, "Notes", bold=True)
 
-    # Hide whatever value the TestMode cell holds (TRUE/FALSE the checkbox
-    # writes there). The cell still functions for read_test_mode; only its
-    # displayed text is suppressed. ";;;" is Excel's "hide all" number format.
-    ws[MAIN_CELLS["TestMode"]].number_format = ";;;"
-
-    # Column widths: only reset on fresh creation (overwrite=True) to respect
-    # any custom widths the user has set.
+    # Only on fresh creation: hide the TestMode cell display and set column
+    # widths. On re-runs we don't touch either — respects user cosmetic edits.
     if overwrite:
+        # ";;;" is Excel's "hide all" number format, so the TRUE/FALSE the
+        # checkbox writes into B5 isn't displayed.
+        ws[MAIN_CELLS["TestMode"]].number_format = ";;;"
         ws.column_dimensions["A"].width = 38
         ws.column_dimensions["B"].width = 60
 

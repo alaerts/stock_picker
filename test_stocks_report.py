@@ -294,6 +294,29 @@ def test_init_workbook_preserves_user_cosmetic_edits(tmp_path):
     assert wb2["Main"].column_dimensions["A"].width == 100
 
 
+def test_init_workbook_preserves_cleared_labels(tmp_path):
+    """If the user CLEARED a label (set to None), a re-run must not restore it.
+
+    This is the trap that caught us on 2026-05-13 — the prior _set helper
+    rewrote any cell whose value was None, which silently undid the user's
+    deliberate clearances of A3 and A5.
+    """
+    from openpyxl import load_workbook
+    path = tmp_path / "stocks.xlsx"
+    init_workbook(path)
+
+    # User clears two section labels.
+    wb = load_workbook(path)
+    wb["Main"]["A3"] = None
+    wb["Main"]["A5"] = None
+    wb.save(path)
+
+    init_workbook(path)  # re-run on existing file
+    wb2 = load_workbook(path)
+    assert wb2["Main"]["A3"].value is None, "A3 was restored after re-run; user cleared it"
+    assert wb2["Main"]["A5"].value is None, "A5 was restored after re-run; user cleared it"
+
+
 # ---------------------------------------------------------------------------
 # ETF list + get_etfs()
 # ---------------------------------------------------------------------------
