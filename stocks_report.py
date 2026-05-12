@@ -940,9 +940,8 @@ def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     _set("A1", "Stock Picker", bold=True, size=16)
 
     _set("A3", "Jobs", bold=True, size=12)
-    _set("A4", "(buttons wired via xlwings — see README)", italic=True, color="666666")
     _set("A5", "Test mode (only refresh BEL20 + 1 quote):")
-    _set("A6", "Status: (live progress while a job runs; last-run summary when idle)")
+    _set("A6", "Status:")
 
     _set("A8", "Metadata", bold=True, size=12)
     _set("A9",  "Last rebuild_inventory:")
@@ -1077,11 +1076,9 @@ def init_workbook(path: Path) -> Path:
     _layout_main_sheet(main_ws, overwrite=overwrite)
     _layout_market_sheet(market_ws, overwrite=overwrite)
 
-    # Seed Test mode = FALSE if blank (don't overwrite user choice). The
-    # cell is replaced by a real Excel checkbox in setup-buttons; until then
-    # the user can edit this text cell directly to flip the mode.
-    if main_ws[MAIN_CELLS["TestMode"]].value is None:
-        main_ws[MAIN_CELLS["TestMode"]] = "FALSE"
+    # Test-mode cell is intentionally left blank on fresh workbooks — the
+    # checkbox added by setup-buttons writes TRUE/FALSE into it. read_test_mode()
+    # treats blank as False, so the workbook is usable even before setup-buttons.
     if main_ws[MAIN_CELLS["Status"]].value is None:
         main_ws[MAIN_CELLS["Status"]] = "Idle. Click a button to refresh."
 

@@ -235,10 +235,11 @@ def test_init_workbook_creates_main_and_market(tmp_path):
     market = wb["Market"]
     headers = [market.cell(row=1, column=i).value for i in range(1, len(MARKET_COLUMNS) + 1)]
     assert headers == MARKET_COLUMNS
-    # Main has the title and named cells initialized
+    # Main has the title; TestMode cell is intentionally blank on fresh init
+    # (the checkbox added by setup-buttons writes TRUE/FALSE into it).
     main = wb["Main"]
     assert main["A1"].value == "Stock Picker"
-    assert main[MAIN_CELLS["TestMode"]].value == "FALSE"
+    assert main[MAIN_CELLS["TestMode"]].value is None
 
 
 def test_init_workbook_is_idempotent(tmp_path):
