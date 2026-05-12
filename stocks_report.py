@@ -186,6 +186,42 @@ _BEL20_TICKER_RE = re.compile(
     r"Euronext\s+(\w+)[\s:\xa0]+([A-Z][A-Z0-9]{0,9})", re.IGNORECASE
 )
 
+_NIKKEI_TICKER_RE = re.compile(r"\(\s*TYO\s*:\s*([0-9A-Z]{4,5})\s*\)")
+
+
+def _parse_nikkei225_components(html: str) -> pd.DataFrame:
+    """Extract (Symbol, Name, Index) rows from the Components section of the
+    English Wikipedia Nikkei 225 page.
+
+    Wikipedia stopped publishing a constituent table for Nikkei 225 sometime
+    in 2025. The 225 stocks now live in bullet lists under sector
+    subheadings, each entry formatted "Company Name (TYO: 9202)" with
+    occasional trailing parenthetical annotations like
+    "(Holding company for X)". Tickers can be 4 digits or 4 chars including
+    letters (e.g. "543A").
+    """
+    start = html.find('id="Components"')
+    end = html.find('id="Statistics"')
+    if start < 0 or end < 0:
+        raise RuntimeError("Could not locate Components section on Nikkei 225 Wikipedia page")
+    body = html[start:end]
+    rows: list[tuple[str, str]] = []
+    for raw in re.findall(r"<li[^>]*>(.+?)</li>", body, re.DOTALL):
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", raw)).strip()
+        m = _NIKKEI_TICKER_RE.search(text)
+        if not m:
+            continue
+        ticker = m.group(1)
+        # Name is the prefix before "(TYO:" — strip stray trailing punctuation
+        name = text[: m.start()].rstrip().rstrip("(").strip()
+        if name and ticker:
+            rows.append((ticker, name))
+    df = pd.DataFrame(rows, columns=["Symbol", "Name"])
+    df["Symbol"] = df["Symbol"].apply(lambda s: normalize_ticker(s, "NIKKEI225"))
+    df["Index"] = "NIKKEI225"
+    return df.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+
+
 def _parse_bel20_ticker(cell: str) -> str:
     """Extract 'SYMBOL.BR' or 'SYMBOL.AS' from a BEL 20 Wikipedia ticker cell.
 
@@ -216,6 +252,13 @@ def get_index_constituents(index_name: str) -> pd.DataFrame:
     # We need a custom UA for Wikipedia too on some networks
     resp = requests.get(url, headers=HTTP_HEADERS, timeout=30)
     resp.raise_for_status()
+
+    if index_name == "NIKKEI225":
+        # Wikipedia restructured the page; no constituent table any more.
+        df = _parse_nikkei225_components(resp.text)
+        log.info(f"  {index_name}: {len(df)} constituents")
+        return df
+
     tables = pd.read_html(io.StringIO(resp.text))
     expected_min = {"BEL20": 15, "CAC40": 30, "DAX": 30, "FTSE100": 80,
                     "NIKKEI225": 150, "SP500": 400, "ESTOXX50": 45}.get(index_name, 10)

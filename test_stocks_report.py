@@ -15,6 +15,7 @@ from stocks_report import (  # noqa: E402
     _extract_dataroma_tickers,
     _owned_for,
     _parse_bel20_ticker,
+    _parse_nikkei225_components,
     _pick_test_target,
     aggregate_constituents,
     init_workbook,
@@ -53,8 +54,10 @@ from stocks_report import (  # noqa: E402
     ("ULVR",     "FTSE100",   "ULVR.L"),
     ("RR.",      "FTSE100",   "RR.L"),
     ("BHP.",     "FTSE100",   "BHP.L"),
-    # Nikkei 225
+    # Nikkei 225 — alphanumeric tickers like 543A.T (Archion) are valid
     ("7203",     "NIKKEI225", "7203.T"),
+    ("543A",     "NIKKEI225", "543A.T"),
+    ("285A",     "NIKKEI225", "285A.T"),
     # Robustness: footnote markers, lowercase
     ("AAPL[1]",  "SP500",     "AAPL"),
     ("aapl",     "SP500",     "AAPL"),
@@ -79,6 +82,59 @@ def test_normalize_ticker(raw, index_name, expected):
 ])
 def test_parse_bel20_ticker(cell, expected):
     assert _parse_bel20_ticker(cell) == expected
+
+
+# ---------------------------------------------------------------------------
+# _parse_nikkei225_components — bullet-list scraping (no table on the page)
+# ---------------------------------------------------------------------------
+
+_NIKKEI_FIXTURE = """
+<h2 id="Components">Components</h2>
+<ul>
+  <li>Energy (0.30%)</li>
+  <li>Materials (7.00%)</li>
+</ul>
+<h3>Air transport</h3>
+<ul>
+  <li>ANA Holdings Inc. (TYO: 9202)</li>
+  <li>Japan Airlines Co., Ltd. (TYO: 9201)</li>
+</ul>
+<h3>Automotive</h3>
+<ul>
+  <li>Archion Corp. (TYO: 543A)</li>
+  <li>Honda Motor Co., Ltd. (TYO: 7267)</li>
+  <li>M3 Inc. (TYO: 2413) (Parent company for MDLinx)</li>
+</ul>
+<h2 id="Statistics">Statistics</h2>
+<li>This must not match (TYO: 9999)</li>
+"""
+
+
+def test_parse_nikkei225_components_extracts_pairs():
+    df = _parse_nikkei225_components(_NIKKEI_FIXTURE)
+    pairs = list(zip(df["Symbol"], df["Name"]))
+    # 5 stocks; sector summary lines and the post-Statistics li are excluded.
+    assert pairs == [
+        ("9202.T", "ANA Holdings Inc."),
+        ("9201.T", "Japan Airlines Co., Ltd."),
+        ("543A.T", "Archion Corp."),
+        ("7267.T", "Honda Motor Co., Ltd."),
+        ("2413.T", "M3 Inc."),
+    ]
+    assert (df["Index"] == "NIKKEI225").all()
+
+
+def test_parse_nikkei225_components_ignores_trailing_annotations():
+    """Entries like 'Foo (TYO: 9147)(Holding company for Foo)' must still parse."""
+    html = '<h2 id="Components">x</h2><li>Foo Corp. (TYO: 9147)(Holding company for Foo)</li><h2 id="Statistics">x</h2>'
+    df = _parse_nikkei225_components(html)
+    assert list(df["Symbol"]) == ["9147.T"]
+    assert list(df["Name"]) == ["Foo Corp."]
+
+
+def test_parse_nikkei225_components_raises_when_no_components_section():
+    with pytest.raises(RuntimeError, match="Components section"):
+        _parse_nikkei225_components("<html>no components header</html>")
 
 
 # ---------------------------------------------------------------------------
