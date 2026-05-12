@@ -50,6 +50,13 @@ from stocks_report import (  # noqa: E402
     # BEL 20
     ("KBC",      "BEL20",     "KBC.BR"),
     ("APAM.AS",  "BEL20",     "APAM.AS"),  # Amsterdam-listed, must not be re-suffixed
+    # Cross-index dedup — regression for the 2026-05-13 batch of bogus rows:
+    ("AIR.PA",   "DAX",       "AIR.PA"),   # Airbus in DAX; was → AIR.PA.DE
+    ("MT.AS",    "CAC40",     "MT.AS"),    # ArcelorMittal in CAC40; was → MT.AS.PA
+    ("ADS.DE",   "ESTOXX50",  "ADS.DE"),   # Adidas in ESTOXX50; suffix already present
+    # FTSE 100 sub-class shares use a hyphen on Yahoo (like SP500's BRK-B):
+    ("BT.A",     "FTSE100",   "BT-A.L"),   # was → BT.A.L
+    ("BT-A.L",   "FTSE100",   "BT-A.L"),   # idempotent
     # EuroStoxx 50: Wikipedia provides fully-qualified Yahoo tickers — pass through
     ("ADS.DE",   "ESTOXX50",  "ADS.DE"),
     ("ADYEN.AS", "ESTOXX50",  "ADYEN.AS"),

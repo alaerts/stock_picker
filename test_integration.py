@@ -41,13 +41,14 @@ pytestmark = pytest.mark.integration
 # pin to an exact number.
 INDEX_EXPECTATIONS = [
     ("BEL20",     18,  {".BR", ".AS"}),
-    ("CAC40",     35,  {".PA"}),
-    ("DAX",       35,  {".DE"}),
+    # CAC40 has a few non-Paris primary listings (ArcelorMittal MT.AS, etc.).
+    ("CAC40",     35,  {".PA", ".AS"}),
+    # DAX has Airbus (AIR.PA) — its primary Yahoo listing is Paris.
+    ("DAX",       35,  {".DE", ".PA"}),
     ("FTSE100",   90,  {".L"}),
     ("NIKKEI225", 200, {".T"}),
     ("SP500",     480, {""}),  # SP500 symbols have no exchange suffix (AAPL, BRK-B)
-    # ESTOXX50 covers the whole Eurozone, so it picks up listings from
-    # Brussels (.BR — ABI, ARGX) too.
+    # ESTOXX50 covers the whole Eurozone, picks up listings from Brussels too.
     ("ESTOXX50",  45,  {".DE", ".PA", ".AS", ".MI", ".MC", ".HE", ".IR", ".BR"}),
 ]
 

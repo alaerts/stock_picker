@@ -208,31 +208,51 @@ LOOKBACKS = {
 # Ticker normalization
 # ---------------------------------------------------------------------------
 
+# Yahoo exchange suffixes we recognize. If a Wikipedia table already lists a
+# ticker in fully-qualified Yahoo form, normalize_ticker passes it through
+# instead of appending its own index's default suffix — prevents double-
+# suffixing when the same stock appears in multiple indexes with different
+# conventions (e.g., Airbus is "AIR.PA" in ESTOXX50/CAC40 and DAX's
+# fully-qualified form is also "AIR.PA", not "AIR.PA.DE").
+KNOWN_EXCHANGE_SUFFIXES = (
+    ".PA", ".DE", ".AS", ".BR", ".MI", ".MC", ".HE", ".IR", ".L", ".T",
+)
+
+
 def normalize_ticker(symbol: str, index_name: str) -> str:
     """Convert a Wikipedia-listed symbol into Yahoo's ticker format."""
     s = str(symbol).strip().upper()
     s = s.split()[0]  # strip footnote markers like "AAA[1]"
     s = re.sub(r"\[.*?\]", "", s)
+
+    # Already fully-qualified — pass through. This is the cross-index
+    # de-dup guard: every per-index rule below would otherwise blindly
+    # append its own suffix.
+    if any(s.endswith(sfx) for sfx in KNOWN_EXCHANGE_SUFFIXES):
+        return s
+
     if index_name == "SP500":
         return s.replace(".", "-")             # BRK.B -> BRK-B
     if index_name == "NIKKEI225":
-        return s if s.endswith(".T") else s + ".T"
+        return s + ".T"
     if index_name == "FTSE100":
         s = s.rstrip(".")                      # "RR." -> "RR"
-        return s if s.endswith(".L") else s + ".L"
+        # Sub-class shares like "BT.A" use a hyphen on Yahoo: BT-A.L.
+        # rstrip("") above only strips a trailing dot; an interior "." (like
+        # in BT.A) survives and must be converted to "-".
+        if "." in s:
+            s = s.replace(".", "-")
+        return s + ".L"
     if index_name == "DAX":
-        return s if s.endswith(".DE") else s + ".DE"
+        return s + ".DE"
     if index_name == "CAC40":
-        return s if s.endswith(".PA") else s + ".PA"
+        return s + ".PA"
     if index_name == "BEL20":
-        # BEL 20 includes one Amsterdam-listed name (APAM); leave .AS alone too.
-        if s.endswith(".BR") or s.endswith(".AS"):
-            return s
         return s + ".BR"
     if index_name == "ESTOXX50":
-        # Wikipedia's ESTOXX 50 table already lists fully-qualified Yahoo
-        # tickers (.DE / .PA / .AS / .MI / .MC / .HE / .IR), spanning multiple
-        # Eurozone exchanges. Pass through as-is.
+        # Wikipedia's ESTOXX 50 table always lists fully-qualified tickers,
+        # which the top-of-function suffix check has already handled. Anything
+        # reaching here is malformed; pass through and let yfinance 404.
         return s
     return s
 
