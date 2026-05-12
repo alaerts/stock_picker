@@ -24,6 +24,7 @@ from stocks_report import (  # noqa: E402
     read_portfolio_symbols,
     read_test_mode,
     to_eur,
+    yahoo_quote_url,
 )
 
 
@@ -285,6 +286,17 @@ def test_init_workbook_preserves_user_cosmetic_edits(tmp_path):
     assert wb2["Main"]["A1"].value == "Patrick's Stock Picker"
     assert wb2["Main"]["A3"].value == "My Custom Jobs Section"
     assert wb2["Main"].column_dimensions["A"].width == 100
+
+
+@pytest.mark.parametrize("symbol,expected", [
+    ("AAPL",    "https://finance.yahoo.com/quote/AAPL"),
+    ("KBC.BR",  "https://finance.yahoo.com/quote/KBC.BR"),
+    ("BRK-B",   "https://finance.yahoo.com/quote/BRK-B"),
+    ("7203.T",  "https://finance.yahoo.com/quote/7203.T"),
+    ("543A.T",  "https://finance.yahoo.com/quote/543A.T"),
+])
+def test_yahoo_quote_url(symbol, expected):
+    assert yahoo_quote_url(symbol) == expected
 
 
 def test_init_workbook_portfolio_header_has_no_quantity(tmp_path):

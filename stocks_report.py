@@ -759,6 +759,19 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 
 DEFAULT_WORKBOOK_PATH = Path("stocks.xlsx")
 
+# Yahoo Finance quote URL template. Used to hyperlink each Market!Symbol cell.
+YAHOO_QUOTE_URL = "https://finance.yahoo.com/quote/{symbol}"
+
+
+def yahoo_quote_url(symbol: str) -> str:
+    """Build the Yahoo Finance quote URL for a Yahoo-formatted ticker.
+
+    Yahoo's URL handles every suffix we use (.BR, .AS, .DE, .PA, .L, .T,
+    .MI, etc.) as-is — no special encoding needed beyond %5E for ^-prefixed
+    indexes, which we don't surface.
+    """
+    return YAHOO_QUOTE_URL.format(symbol=symbol)
+
 
 def _resolve_workbook(arg_path: str) -> Path:
     """Auto-upgrade: if the user kept the default 'stocks.xlsx' but
@@ -1084,7 +1097,9 @@ def rebuild_inventory(
         first_index = c["Indexes"].split(",")[0].strip()
         ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(first_index, "")
 
-        market_ws.cell(row=row, column=cols["Symbol"],      value=sym)
+        sym_cell = market_ws.cell(row=row, column=cols["Symbol"], value=sym)
+        sym_cell.hyperlink = yahoo_quote_url(sym)
+        sym_cell.style = "Hyperlink"
         market_ws.cell(row=row, column=cols["Name"],        value=info.get("longName") or c["Name"])
         market_ws.cell(row=row, column=cols["Owned?"],      value=_owned_for(sym, portfolio))
         market_ws.cell(row=row, column=cols["Indexes"],     value=c["Indexes"])
@@ -1208,13 +1223,27 @@ def button_rebuild_inventory() -> None:
             rows.append(row)
 
         status(f"Writing {len(rows)} rows to Market…")
-        # Clear existing data rows
+        # Clear existing data rows + their hyperlinks. clear_contents leaves
+        # hyperlinks attached as ghost references; clear() wipes both.
         last_row = market.used_range.last_cell.row
         if last_row >= 2:
-            market.range(f"A2:{get_column_letter(len(MARKET_COLUMNS))}{last_row}").clear_contents()
+            market.range(f"A2:{get_column_letter(len(MARKET_COLUMNS))}{last_row}").clear()
         # Bulk write — single COM call
         if rows:
             market.range((2, 1)).value = rows
+            # Attach Yahoo hyperlink to each Symbol cell. One COM call per row;
+            # ~975 calls take ~5 sec total which is dwarfed by the .info loop.
+            sym_col_idx = MARKET_COLUMNS.index("Symbol") + 1
+            for offset, row_data in enumerate(rows):
+                sym = row_data[sym_col_idx - 1]
+                if not sym:
+                    continue
+                cell = market.range((2 + offset, sym_col_idx))
+                market.api.Hyperlinks.Add(
+                    Anchor=cell.api,
+                    Address=yahoo_quote_url(sym),
+                    TextToDisplay=sym,
+                )
 
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         main.range(MAIN_CELLS["LastRebuildAt"]).value = now_iso
