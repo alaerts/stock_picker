@@ -11,12 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stocks_report import (  # noqa: E402
     MAIN_CELLS,
     MARKET_COLUMNS,
+    PORTFOLIO_FIRST_ROW,
     _extract_dataroma_tickers,
+    _owned_for,
     _parse_bel20_ticker,
     aggregate_constituents,
     init_workbook,
     normalize_ticker,
     price_at_or_before,
+    read_portfolio_symbols,
     to_eur,
 )
 
@@ -176,8 +179,8 @@ def test_init_workbook_is_idempotent(tmp_path):
     # User adds a portfolio entry and toggles test mode.
     wb = load_workbook(path)
     main = wb["Main"]
-    main["A5"] = "KBC.BR"     # portfolio symbol
-    main["B5"] = 10            # quantity
+    main.cell(row=PORTFOLIO_FIRST_ROW, column=1, value="KBC.BR")
+    main.cell(row=PORTFOLIO_FIRST_ROW, column=2, value=10)
     main[MAIN_CELLS["TestMode"]] = "TRUE"
     market = wb["Market"]
     market["A2"] = "FAKE.XX"   # pretend Market has data already
@@ -186,8 +189,8 @@ def test_init_workbook_is_idempotent(tmp_path):
     # Run init again — user data MUST survive.
     init_workbook(path)
     wb2 = load_workbook(path)
-    assert wb2["Main"]["A5"].value == "KBC.BR"
-    assert wb2["Main"]["B5"].value == 10
+    assert wb2["Main"].cell(row=PORTFOLIO_FIRST_ROW, column=1).value == "KBC.BR"
+    assert wb2["Main"].cell(row=PORTFOLIO_FIRST_ROW, column=2).value == 10
     assert wb2["Main"][MAIN_CELLS["TestMode"]].value == "TRUE"
     assert wb2["Market"]["A2"].value == "FAKE.XX"
 
@@ -195,6 +198,48 @@ def test_init_workbook_is_idempotent(tmp_path):
 def test_init_workbook_market_columns_unique():
     """No duplicate column names — otherwise lookups by name would be ambiguous."""
     assert len(MARKET_COLUMNS) == len(set(MARKET_COLUMNS))
+
+
+# ---------------------------------------------------------------------------
+# _owned_for & read_portfolio_symbols
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("symbol,portfolio,expected", [
+    ("KBC.BR",  {"KBC.BR"},        "Yes"),
+    ("KBC.BR",  {"KBC"},           "Yes"),   # suffix-stripped match
+    ("AAPL",    {"AAPL"},          "Yes"),
+    ("AAPL",    {"GOOGL"},         "No"),
+    ("BRK-B",   {"BRK-B"},         "Yes"),   # hyphen form
+    ("KBC.BR",  set(),             "No"),
+])
+def test_owned_for(symbol, portfolio, expected):
+    assert _owned_for(symbol, portfolio) == expected
+
+
+def test_read_portfolio_symbols_skips_blanks_and_normalizes(tmp_path):
+    """Reads col A of the portfolio range, uppercase + strip, skip None/empty."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Main"
+    ws.cell(row=PORTFOLIO_FIRST_ROW,     column=1, value="  kbc.br  ")  # whitespace + lower
+    ws.cell(row=PORTFOLIO_FIRST_ROW + 1, column=1, value=None)            # blank
+    ws.cell(row=PORTFOLIO_FIRST_ROW + 2, column=1, value="AAPL")
+    ws.cell(row=PORTFOLIO_FIRST_ROW + 3, column=1, value="")              # empty string
+    assert read_portfolio_symbols(ws) == {"KBC.BR", "AAPL"}
+
+
+def test_read_portfolio_symbols_ignores_main_section_labels(tmp_path):
+    """Regression: a fresh init_workbook must have an empty portfolio set.
+
+    Previously the portfolio range overlapped with the Jobs/Status/Metadata
+    section labels in column A, so every label was being parsed as a "symbol".
+    """
+    path = tmp_path / "stocks.xlsx"
+    init_workbook(path)
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    assert read_portfolio_symbols(wb["Main"]) == set()
 
 
 # ---------------------------------------------------------------------------

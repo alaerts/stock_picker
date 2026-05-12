@@ -49,7 +49,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 import requests
@@ -506,12 +506,22 @@ def fetch_ticker_info(ticker: str) -> dict:
         "description": info.get("longBusinessSummary") or "",
     }
 
-def fetch_all_info(tickers: list[str], delay: float = 0.25) -> dict[str, dict]:
+def fetch_all_info(tickers: list[str], delay: float = 0.25,
+                   progress: Optional[Callable[[int, int, str], None]] = None) -> dict[str, dict]:
+    """Fetch yfinance .info for each ticker. Optional ``progress`` callback is
+    invoked as ``progress(done, total, current_symbol)`` before each fetch — used
+    by rebuild_inventory to push live ticker count into the workbook's Status cell.
+    """
     log.info(f"Fetching .info for {len(tickers)} tickers (delay={delay}s)")
     out: dict[str, dict] = {}
     for i, t in enumerate(tickers, 1):
         if i % 50 == 0 or i == 1:
             log.info(f"  info {i}/{len(tickers)}")
+        if progress is not None:
+            try:
+                progress(i, len(tickers), t)
+            except Exception as e:
+                log.debug(f"progress callback failed: {e}")
         out[t] = fetch_ticker_info(t)
         time.sleep(delay)
     return out
@@ -703,23 +713,23 @@ MARKET_COLUMNS = [
     "Description", "Last update (UTC)", "Last error",
 ]
 
-# Main sheet — named cells. Code reads/writes these by name; layout can
-# move within the sheet as long as the dict tracks it.
+# Main sheet — named cells. All controls/metadata live ABOVE the portfolio
+# area so the portfolio can grow freely without colliding with them.
 MAIN_CELLS: dict[str, str] = {
-    "TestMode":       "B21",  # TRUE / FALSE
-    "Status":         "B22",  # live progress text written during job runs
-    "LastRebuildAt":  "B25",
-    "LastQuotesAt":   "B26",
-    "MarketRowCount": "B27",
-    "EurUsd":         "B28",
-    "EurJpy":         "B29",
-    "EurGbp":         "B30",
+    "TestMode":       "B5",   # TRUE / FALSE
+    "Status":         "B6",   # live progress text written during job runs
+    "LastRebuildAt":  "B9",
+    "LastQuotesAt":   "B10",
+    "MarketRowCount": "B11",
+    "EurUsd":         "B12",
+    "EurJpy":         "B13",
+    "EurGbp":         "B14",
 }
 
-# Portfolio area on Main: header row + N rows for user entries.
-PORTFOLIO_HEADER_ROW = 4
-PORTFOLIO_FIRST_ROW = 5
-PORTFOLIO_LAST_ROW = 100  # user can have up to 96 manual entries
+# Portfolio area on Main: header row + many rows for user entries.
+PORTFOLIO_HEADER_ROW = 17
+PORTFOLIO_FIRST_ROW = 18
+PORTFOLIO_LAST_ROW = 999  # plenty of room; never collides with controls above
 
 
 def _bold(cell, size: int = 11) -> None:
@@ -727,13 +737,42 @@ def _bold(cell, size: int = 11) -> None:
 
 
 def _layout_main_sheet(ws: Worksheet) -> None:
-    """Write the static layout of the Main sheet — title, portfolio header,
-    section labels, metadata field labels. Does NOT touch user data cells."""
+    """Write the static layout of the Main sheet — title, controls + metadata
+    at the top, then portfolio header. Does NOT touch user data cells.
+
+    Layout:
+      Row 1   : title
+      Row 3   : "Jobs" section
+      Row 4   : (xlwings button hint)
+      Row 5   : Test mode label + cell
+      Row 6   : Status label + cell
+      Row 8   : "Metadata" section
+      Row 9-14: timestamps + FX rates
+      Row 16  : "Portfolio" section
+      Row 17  : Portfolio header (Symbol / Quantity / Notes)
+      Row 18+ : user portfolio entries
+    """
     ws["A1"] = "Stock Picker"
     _bold(ws["A1"], size=16)
 
-    ws["A3"] = "Portfolio (manual — list every Symbol you own)"
+    ws["A3"] = "Jobs"
     _bold(ws["A3"], size=12)
+    ws["A4"] = "(buttons wired via xlwings — see README)"
+    ws["A4"].font = Font(italic=True, color="666666")
+    ws["A5"] = "Test mode (only refresh BEL20 + 1 quote):"
+    ws["A6"] = "Status:"
+
+    ws["A8"] = "Metadata"
+    _bold(ws["A8"], size=12)
+    ws["A9"]  = "Last rebuild_inventory:"
+    ws["A10"] = "Last get_quotes:"
+    ws["A11"] = "Total rows in Market:"
+    ws["A12"] = "EUR/USD (1 EUR = X USD):"
+    ws["A13"] = "EUR/JPY (1 EUR = X JPY):"
+    ws["A14"] = "EUR/GBP (1 EUR = X GBP):"
+
+    ws["A16"] = "Portfolio (manual — list every Symbol you own)"
+    _bold(ws["A16"], size=12)
 
     ws.cell(row=PORTFOLIO_HEADER_ROW, column=1, value="Symbol")
     ws.cell(row=PORTFOLIO_HEADER_ROW, column=2, value="Quantity")
@@ -741,25 +780,6 @@ def _layout_main_sheet(ws: Worksheet) -> None:
     for col in (1, 2, 3):
         _bold(ws.cell(row=PORTFOLIO_HEADER_ROW, column=col))
 
-    ws["A19"] = "Jobs"
-    _bold(ws["A19"], size=12)
-    ws["A20"] = "(buttons wired via xlwings — see README)"
-    ws["A20"].font = Font(italic=True, color="666666")
-
-    ws["A21"] = "Test mode (only refresh BEL20 + 1 quote):"
-    ws["A22"] = "Status:"
-
-    ws["A24"] = "Metadata"
-    _bold(ws["A24"], size=12)
-
-    ws["A25"] = "Last rebuild_inventory:"
-    ws["A26"] = "Last get_quotes:"
-    ws["A27"] = "Total rows in Market:"
-    ws["A28"] = "EUR/USD (1 EUR = X USD):"
-    ws["A29"] = "EUR/JPY (1 EUR = X JPY):"
-    ws["A30"] = "EUR/GBP (1 EUR = X GBP):"
-
-    # Column widths
     ws.column_dimensions["A"].width = 36
     ws.column_dimensions["B"].width = 24
     ws.column_dimensions["C"].width = 40
@@ -786,6 +806,37 @@ def _layout_market_sheet(ws: Worksheet) -> None:
     }
     for col_idx, name in enumerate(MARKET_COLUMNS, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
+
+
+def _market_col(name: str) -> int:
+    """1-based column index in Market for a header name. Raises if unknown."""
+    return MARKET_COLUMNS.index(name) + 1
+
+
+def read_portfolio_symbols(main_ws: Worksheet) -> set[str]:
+    """Read the Main sheet's manual portfolio area, returning normalized symbols."""
+    out: set[str] = set()
+    for r in range(PORTFOLIO_FIRST_ROW, PORTFOLIO_LAST_ROW + 1):
+        v = main_ws.cell(row=r, column=1).value
+        if v is None:
+            continue
+        sym = str(v).strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _owned_for(symbol: str, portfolio: set[str]) -> str:
+    """Return "Yes" if the Market symbol matches a portfolio entry, else "No".
+
+    Tolerates suffix mismatch: portfolio entry "KBC" matches Market "KBC.BR".
+    """
+    if symbol in portfolio:
+        return "Yes"
+    root = re.sub(r"\.[A-Z]{1,3}$", "", symbol)
+    if root in portfolio:
+        return "Yes"
+    return "No"
 
 
 def init_workbook(path: Path) -> Path:
@@ -824,6 +875,114 @@ def init_workbook(path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Job 1: rebuild_inventory — refresh Market structural data
+# ---------------------------------------------------------------------------
+#
+# Fetches the universe of stocks (constituents + watchlist memberships +
+# company info) and overwrites the Market sheet in place. Quote columns are
+# left blank for get_quotes to fill.
+
+def rebuild_inventory(
+    workbook_path: Path,
+    indexes: Optional[list[str]] = None,
+    info_delay: float = 0.25,
+    status: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Rebuild the Market sheet from scratch. Preserves Main (portfolio + cells)
+    other than the metadata cells this job owns.
+
+    ``indexes``: subset of INDEX_WIKI keys; defaults to all.
+    ``status``: optional one-arg callback for live progress text (Phase 8
+                wires this to Main!Status via xlwings; CLI mode passes None
+                and progress goes to the log instead).
+    """
+    workbook_path = Path(workbook_path)
+    if not workbook_path.exists():
+        log.info(f"Workbook {workbook_path} does not exist — running init-workbook first")
+        init_workbook(workbook_path)
+
+    def _say(msg: str) -> None:
+        log.info(msg)
+        if status is not None:
+            try:
+                status(msg)
+            except Exception as e:
+                log.debug(f"status callback raised: {e}")
+
+    indexes = indexes or list(INDEX_WIKI.keys())
+    t0 = time.time()
+    _say(f"rebuild_inventory: starting ({', '.join(indexes)})")
+
+    _say("Reading portfolio from Main")
+    wb = load_workbook(workbook_path)
+    portfolio = read_portfolio_symbols(wb["Main"])
+    _say(f"  Portfolio entries: {len(portfolio)}")
+
+    _say("Fetching index constituents")
+    constituents = aggregate_constituents([get_index_constituents(idx) for idx in indexes])
+    _say(f"  Total unique tickers: {len(constituents)}")
+
+    _say("Fetching watchlists")
+    wl_membership = fetch_all_watchlists()
+
+    _say(f"Fetching .info for {len(constituents)} tickers — this is the slow part")
+
+    def info_progress(done: int, total: int, sym: str) -> None:
+        # Throttle status updates: report every 25 tickers + at boundaries.
+        if status is not None and (done == 1 or done == total or done % 25 == 0):
+            status(f"info {done}/{total} — {sym}")
+
+    info_map = fetch_all_info(list(constituents["Symbol"]), delay=info_delay,
+                              progress=info_progress)
+
+    _say("Writing Market sheet")
+    market_ws = wb["Market"]
+    # Clear existing data rows (preserve row 1 headers).
+    if market_ws.max_row > 1:
+        market_ws.delete_rows(2, market_ws.max_row - 1)
+
+    sym_col = _market_col("Symbol")
+    cols = {name: i + 1 for i, name in enumerate(MARKET_COLUMNS)}
+
+    for r_offset, (_, c) in enumerate(constituents.iterrows(), 0):
+        row = 2 + r_offset
+        sym = c["Symbol"]
+        info = info_map.get(sym, {})
+
+        # Watchlist membership: try sym + suffix-stripped root
+        sym_root = re.sub(r"\.[A-Z]{1,3}$", "", sym)
+        labels: list[str] = []
+        for key in {sym, sym_root}:
+            labels.extend(wl_membership.get(key, []))
+        seen = set()
+        labels_dedup = [x for x in labels if not (x in seen or seen.add(x))]
+
+        first_index = c["Indexes"].split(",")[0].strip()
+        ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(first_index, "")
+
+        market_ws.cell(row=row, column=cols["Symbol"],      value=sym)
+        market_ws.cell(row=row, column=cols["Name"],        value=info.get("longName") or c["Name"])
+        market_ws.cell(row=row, column=cols["Owned?"],      value=_owned_for(sym, portfolio))
+        market_ws.cell(row=row, column=cols["Indexes"],     value=c["Indexes"])
+        market_ws.cell(row=row, column=cols["Sector"],      value=info.get("sector") or "")
+        market_ws.cell(row=row, column=cols["Watchlists"],  value=", ".join(labels_dedup))
+        market_ws.cell(row=row, column=cols["Currency"],    value=ccy)
+        market_ws.cell(row=row, column=cols["Description"], value=info.get("description") or "")
+        # Quote columns and Last update/error are left blank for get_quotes.
+
+    # Update Main metadata cells
+    main_ws = wb["Main"]
+    now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    main_ws[MAIN_CELLS["LastRebuildAt"]] = now_iso
+    main_ws[MAIN_CELLS["MarketRowCount"]] = len(constituents)
+
+    wb.save(workbook_path)
+    duration = time.time() - t0
+    _say(f"rebuild_inventory: done in {duration:.0f}s. {len(constituents)} rows.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -854,6 +1013,25 @@ def _cmd_init_workbook(args) -> int:
     return 0
 
 
+def _cmd_rebuild_inventory(args) -> int:
+    """Job 1 — refresh the Market sheet structural data (no quotes)."""
+    indexes = None
+    if args.test:
+        indexes = ["BEL20"]  # test mode is a one-index smoke
+    elif args.indexes and args.indexes.upper() != "ALL":
+        indexes = [s.strip().upper() for s in args.indexes.split(",")]
+        unknown = [i for i in indexes if i not in INDEX_WIKI]
+        if unknown:
+            log.error(f"Unknown index(es): {unknown}")
+            log.error(f"Valid: {list(INDEX_WIKI.keys())}")
+            return 2
+    return rebuild_inventory(
+        workbook_path=Path(args.workbook),
+        indexes=indexes,
+        info_delay=args.info_delay,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd")
@@ -866,6 +1044,28 @@ def main() -> int:
     p_init.add_argument(
         "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
         help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
+    )
+
+    # rebuild-inventory — Job 1 (no quotes; populates Market structural data)
+    p_rebuild = sub.add_parser(
+        "rebuild-inventory",
+        help="Job 1: refresh the Market sheet's structural data (no quote fetch).",
+    )
+    p_rebuild.add_argument(
+        "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
+        help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
+    )
+    p_rebuild.add_argument(
+        "--indexes", default="ALL",
+        help="Subset of indexes to refresh (default: ALL).",
+    )
+    p_rebuild.add_argument(
+        "--info-delay", type=float, default=0.25,
+        help="Seconds between yfinance .info calls (default: 0.25)",
+    )
+    p_rebuild.add_argument(
+        "--test", action="store_true",
+        help="Test mode: BEL20 only.",
     )
 
     # run — legacy single-shot all-in-one report (default when no subcommand)
@@ -889,8 +1089,9 @@ def main() -> int:
     # Legacy compat: when called as `stocks_report.py --indexes BEL20` with
     # no subcommand, fall back to the run subparser. Detect by looking for
     # a known top-level flag.
+    known_subcommands = {"init-workbook", "rebuild-inventory", "run", "-h", "--help"}
     raw_args = sys.argv[1:]
-    if raw_args and raw_args[0] not in {"init-workbook", "run", "-h", "--help"}:
+    if raw_args and raw_args[0] not in known_subcommands:
         raw_args = ["run", *raw_args]
     args = parser.parse_args(raw_args)
 
@@ -902,6 +1103,8 @@ def main() -> int:
         return _cmd_legacy_run(args)
     if args.cmd == "init-workbook":
         return _cmd_init_workbook(args)
+    if args.cmd == "rebuild-inventory":
+        return _cmd_rebuild_inventory(args)
 
     parser.print_help()
     return 2
