@@ -267,6 +267,40 @@ def test_init_workbook_market_columns_unique():
     assert len(MARKET_COLUMNS) == len(set(MARKET_COLUMNS))
 
 
+def test_init_workbook_preserves_user_cosmetic_edits(tmp_path):
+    """User edits to label text and column widths must survive a re-run."""
+    from openpyxl import load_workbook
+    path = tmp_path / "stocks.xlsx"
+    init_workbook(path)
+
+    # Pretend the user renamed the title and widened column A.
+    wb = load_workbook(path)
+    wb["Main"]["A1"] = "Patrick's Stock Picker"
+    wb["Main"].column_dimensions["A"].width = 100
+    wb["Main"]["A3"] = "My Custom Jobs Section"  # custom section label
+    wb.save(path)
+
+    init_workbook(path)  # re-run on existing file
+    wb2 = load_workbook(path)
+    assert wb2["Main"]["A1"].value == "Patrick's Stock Picker"
+    assert wb2["Main"]["A3"].value == "My Custom Jobs Section"
+    assert wb2["Main"].column_dimensions["A"].width == 100
+
+
+def test_init_workbook_portfolio_header_has_no_quantity(tmp_path):
+    """Portfolio header should be just Symbol / Notes (Quantity removed)."""
+    from openpyxl import load_workbook
+    from stocks_report import PORTFOLIO_HEADER_ROW
+    path = tmp_path / "stocks.xlsx"
+    init_workbook(path)
+    wb = load_workbook(path)
+    main = wb["Main"]
+    assert main.cell(row=PORTFOLIO_HEADER_ROW, column=1).value == "Symbol"
+    assert main.cell(row=PORTFOLIO_HEADER_ROW, column=2).value == "Notes"
+    # Column 3 should now be blank (Quantity was removed)
+    assert main.cell(row=PORTFOLIO_HEADER_ROW, column=3).value is None
+
+
 # ---------------------------------------------------------------------------
 # _owned_for & read_portfolio_symbols
 # ---------------------------------------------------------------------------

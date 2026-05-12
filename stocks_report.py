@@ -803,76 +803,94 @@ def _bold(cell, size: int = 11) -> None:
     cell.font = Font(bold=True, size=size)
 
 
-def _layout_main_sheet(ws: Worksheet) -> None:
+def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     """Write the static layout of the Main sheet — title, controls + metadata
     at the top, then portfolio header. Does NOT touch user data cells.
+
+    With overwrite=False, only fills cells that are currently blank — used on
+    re-runs of init-workbook so user cosmetic edits / renames survive.
 
     Layout:
       Row 1   : title
       Row 3   : "Jobs" section
       Row 4   : (xlwings button hint)
-      Row 5   : Test mode label + cell
-      Row 6   : Status label + cell
+      Row 5   : Test mode label + checkbox cell (B5)
+      Row 6   : Status label + live progress cell (B6)
       Row 8   : "Metadata" section
       Row 9-14: timestamps + FX rates
       Row 16  : "Portfolio" section
-      Row 17  : Portfolio header (Symbol / Quantity / Notes)
+      Row 17  : Portfolio header (Symbol / Notes)
       Row 18+ : user portfolio entries
     """
-    ws["A1"] = "Stock Picker"
-    _bold(ws["A1"], size=16)
+    def _set(addr: str, value, *, bold: bool = False, size: int = 11,
+             italic: bool = False, color: Optional[str] = None) -> None:
+        cell = ws[addr]
+        if overwrite or cell.value is None:
+            cell.value = value
+        # Style only when the value matches what we just wrote — leaves
+        # user-edited labels with their own styling.
+        if cell.value == value:
+            font_kwargs = {"size": size}
+            if bold: font_kwargs["bold"] = True
+            if italic: font_kwargs["italic"] = True
+            if color: font_kwargs["color"] = color
+            cell.font = Font(**font_kwargs)
 
-    ws["A3"] = "Jobs"
-    _bold(ws["A3"], size=12)
-    ws["A4"] = "(buttons wired via xlwings — see README)"
-    ws["A4"].font = Font(italic=True, color="666666")
-    ws["A5"] = "Test mode (only refresh BEL20 + 1 quote):"
-    ws["A6"] = "Status:"
+    _set("A1", "Stock Picker", bold=True, size=16)
 
-    ws["A8"] = "Metadata"
-    _bold(ws["A8"], size=12)
-    ws["A9"]  = "Last rebuild_inventory:"
-    ws["A10"] = "Last get_quotes:"
-    ws["A11"] = "Total rows in Market:"
-    ws["A12"] = "EUR/USD (1 EUR = X USD):"
-    ws["A13"] = "EUR/JPY (1 EUR = X JPY):"
-    ws["A14"] = "EUR/GBP (1 EUR = X GBP):"
+    _set("A3", "Jobs", bold=True, size=12)
+    _set("A4", "(buttons wired via xlwings — see README)", italic=True, color="666666")
+    _set("A5", "Test mode (only refresh BEL20 + 1 quote):")
+    _set("A6", "Status: (live progress while a job runs; last-run summary when idle)")
 
-    ws["A16"] = "Portfolio (manual — list every Symbol you own)"
-    _bold(ws["A16"], size=12)
+    _set("A8", "Metadata", bold=True, size=12)
+    _set("A9",  "Last rebuild_inventory:")
+    _set("A10", "Last get_quotes:")
+    _set("A11", "Total rows in Market:")
+    _set("A12", "EUR/USD (1 EUR = X USD):")
+    _set("A13", "EUR/JPY (1 EUR = X JPY):")
+    _set("A14", "EUR/GBP (1 EUR = X GBP):")
 
-    ws.cell(row=PORTFOLIO_HEADER_ROW, column=1, value="Symbol")
-    ws.cell(row=PORTFOLIO_HEADER_ROW, column=2, value="Quantity")
-    ws.cell(row=PORTFOLIO_HEADER_ROW, column=3, value="Notes")
-    for col in (1, 2, 3):
-        _bold(ws.cell(row=PORTFOLIO_HEADER_ROW, column=col))
+    _set("A16", "Portfolio (manual — list every Symbol you own)", bold=True, size=12)
 
-    ws.column_dimensions["A"].width = 36
-    ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 40
+    _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=1).coordinate, "Symbol", bold=True)
+    _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=2).coordinate, "Notes", bold=True)
+
+    # Column widths: only reset on fresh creation (overwrite=True) to respect
+    # any custom widths the user has set.
+    if overwrite:
+        ws.column_dimensions["A"].width = 38
+        ws.column_dimensions["B"].width = 60
 
 
-def _layout_market_sheet(ws: Worksheet) -> None:
+def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     """Write Market sheet headers, freeze pane, column widths. Does not touch
-    data rows."""
+    data rows.
+
+    With overwrite=False (re-run path), header text is always re-asserted
+    (the script's column-name lookups depend on it) but bold + fill styling
+    and column widths are left alone so user cosmetic choices survive.
+    """
     for col_idx, name in enumerate(MARKET_COLUMNS, 1):
-        cell = ws.cell(row=1, column=col_idx, value=name)
-        _bold(cell)
-        cell.fill = PatternFill("solid", fgColor="F2F2F2")
+        cell = ws.cell(row=1, column=col_idx)
+        if overwrite or cell.value is None or cell.value != name:
+            cell.value = name
+        if overwrite:
+            _bold(cell)
+            cell.fill = PatternFill("solid", fgColor="F2F2F2")
     ws.freeze_panes = "A2"
 
-    # Per-column widths tuned for readability. Description is wide; quote
-    # columns stay narrow.
-    widths = {
-        "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18, "Sector": 22,
-        "Watchlists": 38, "Currency": 10,
-        "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
-        "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
-        "P/E (TTM)": 10, "Forward P/E": 10,
-        "Description": 60, "Last update (UTC)": 20, "Last error": 30,
-    }
-    for col_idx, name in enumerate(MARKET_COLUMNS, 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
+    if overwrite:
+        widths = {
+            "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18, "Sector": 22,
+            "Watchlists": 38, "Currency": 10,
+            "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
+            "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
+            "P/E (TTM)": 10, "Forward P/E": 10,
+            "Description": 60, "Last update (UTC)": 20, "Last error": 30,
+        }
+        for col_idx, name in enumerate(MARKET_COLUMNS, 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
 
 
 def _market_col(name: str) -> int:
@@ -941,10 +959,11 @@ def init_workbook(path: Path) -> Path:
     """
     path = Path(path)
     if path.exists():
-        log.info(f"Refreshing workbook layout in {path} (data preserved)")
+        log.info(f"Refreshing workbook layout in {path} (data + cosmetics preserved)")
         wb = _load_xl(path)
         main_ws = wb["Main"] if "Main" in wb.sheetnames else wb.create_sheet("Main", 0)
         market_ws = wb["Market"] if "Market" in wb.sheetnames else wb.create_sheet("Market", 1)
+        overwrite = False
     else:
         log.info(f"Creating workbook {path}")
         wb = Workbook()
@@ -952,15 +971,18 @@ def init_workbook(path: Path) -> Path:
         main_ws = wb.active
         main_ws.title = "Main"
         market_ws = wb.create_sheet("Market")
+        overwrite = True
 
-    _layout_main_sheet(main_ws)
-    _layout_market_sheet(market_ws)
+    _layout_main_sheet(main_ws, overwrite=overwrite)
+    _layout_market_sheet(market_ws, overwrite=overwrite)
 
-    # Seed Test mode = FALSE if blank (don't overwrite user choice).
+    # Seed Test mode = FALSE if blank (don't overwrite user choice). The
+    # cell is replaced by a real Excel checkbox in setup-buttons; until then
+    # the user can edit this text cell directly to flip the mode.
     if main_ws[MAIN_CELLS["TestMode"]].value is None:
         main_ws[MAIN_CELLS["TestMode"]] = "FALSE"
     if main_ws[MAIN_CELLS["Status"]].value is None:
-        main_ws[MAIN_CELLS["Status"]] = "(idle — never run)"
+        main_ws[MAIN_CELLS["Status"]] = "Idle. Click a button to refresh."
 
     wb.save(path)
     log.info(f"Workbook ready: {path.resolve()}")
@@ -1536,14 +1558,19 @@ def _cmd_setup_buttons(args) -> int:
             if shp.name.startswith("StockPicker_"):
                 shp.delete()
 
-        # 3. Add two buttons in the Jobs section. AddFormControl(type, left,
-        #    top, w, h) — xlFormControl constant 0 is button (1 is checkbox).
+        # 3. Add two buttons + a Test-mode checkbox in the Jobs area to the
+        #    right of column B. Column A (~38 chars ≈ 270 px) and column B
+        #    (~60 chars ≈ 430 px) together reach left=700, so buttons live
+        #    at left=720+ to avoid hiding either.
+        #    Shapes.AddFormControl(type, left, top, w, h):
+        #      0 = msoFormControlButton
+        #      1 = msoFormControlCheckBox
         sheet_api = main.api
-        btn1 = sheet_api.Shapes.AddFormControl(0, 250, 50, 130, 28)
+        btn1 = sheet_api.Shapes.AddFormControl(0, 720, 10, 130, 28)
         btn1.Name = "StockPicker_Rebuild"
         btn1.TextFrame.Characters().Text = "Rebuild Inventory"
         btn1.OnAction = "RebuildInventory"
-        btn2 = sheet_api.Shapes.AddFormControl(0, 250, 82, 130, 28)
+        btn2 = sheet_api.Shapes.AddFormControl(0, 720, 42, 130, 28)
         btn2.Name = "StockPicker_GetQuotes"
         btn2.TextFrame.Characters().Text = "Get Quotes"
         btn2.OnAction = "GetQuotes"
