@@ -1480,16 +1480,16 @@ def _cmd_setup_buttons(args) -> int:
             if shp.name.startswith("StockPicker_"):
                 shp.delete()
 
-        # 3. Add two buttons in the Jobs section. AddFormControl(1, left, top, w, h)
-        #    where 1 = msoFormControlButton.
+        # 3. Add two buttons in the Jobs section. AddFormControl(type, left,
+        #    top, w, h) — xlFormControl constant 0 is button (1 is checkbox).
         sheet_api = main.api
-        btn1 = sheet_api.Shapes.AddFormControl(1, 250, 50, 130, 28)
+        btn1 = sheet_api.Shapes.AddFormControl(0, 250, 50, 130, 28)
         btn1.Name = "StockPicker_Rebuild"
-        btn1.TextFrame.Characters.Text = "Rebuild Inventory"
+        btn1.TextFrame.Characters().Text = "Rebuild Inventory"
         btn1.OnAction = "RebuildInventory"
-        btn2 = sheet_api.Shapes.AddFormControl(1, 250, 82, 130, 28)
+        btn2 = sheet_api.Shapes.AddFormControl(0, 250, 82, 130, 28)
         btn2.Name = "StockPicker_GetQuotes"
-        btn2.TextFrame.Characters.Text = "Get Quotes"
+        btn2.TextFrame.Characters().Text = "Get Quotes"
         btn2.OnAction = "GetQuotes"
 
         # 4. SaveAs .xlsm (FileFormat 52 = xlOpenXMLWorkbookMacroEnabled).
