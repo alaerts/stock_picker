@@ -3,11 +3,14 @@
 ## What this is
 
 A personal stock-tracking workbook driven by Python. One persistent
-`stocks.xlsm` covering ~975 deduped stocks across 7 indexes (SP500, NIKKEI225,
-FTSE100, DAX, CAC40, BEL20, ESTOXX50). The user opens Excel, clicks a button,
-sees live progress in a Status cell, and ends up with refreshed data — all in
-EUR at today's FX rate, plus a manually-maintained portfolio sheet that drives
-an Owned? column on the data sheet.
+`stocks.xlsm` covering **~1000 tickers** — ~975 deduped stocks across 7
+indexes (SP500, NIKKEI225, FTSE100, DAX, CAC40, BEL20, ESTOXX50) plus 38
+curated ETFs (one per index, eleven sector SPDRs, twenty single-country
+iShares MSCI funds). The user opens Excel, clicks a button, sees live
+progress in a Status cell, and ends up with refreshed data — all in EUR
+at today's FX rate, plus a manually-maintained portfolio sheet that drives
+an Owned? column on the data sheet. Every Symbol cell is hyperlinked
+to its Yahoo Finance quote page.
 
 User is in Brussels (hence EUR base, BEL20 inclusion). Has a Raspberry Pi
 running Home Assistant — possible target for headless CLI scheduling. Technical
@@ -24,12 +27,20 @@ Two CLI jobs (also wired to Excel buttons via xlwings):
   Sets per-row Last update / Last error. Surgical update — preserves
   structural columns.
 
-One workbook, three sheets:
+One workbook, four sheets (Errors created on demand):
 
-- **Main**: manual portfolio + job controls + Status cell + metadata block
-  (last-run timestamps, FX rates, row count). TestMode lives at `Main!B5`.
+- **Main**: manual portfolio (Symbol + Notes — no Quantity), job controls
+  (two buttons + a real Excel checkbox for test mode), Status cell, and
+  the metadata block (last-run timestamps, FX rates, row count). Controls
+  live at left=720 to clear column B; portfolio data starts at row 18.
+  TestMode is the linked cell behind the checkbox (`Main!B5`).
 - **Market**: 19-column inventory of the universe (see `MARKET_COLUMNS`).
+  Every Symbol cell carries a Yahoo Finance hyperlink (
+  `https://finance.yahoo.com/quote/{symbol}`).
 - **xlwings.conf** (very-hidden): interpreter path + PYTHONPATH for xlwings.
+- **Errors** (created on first failure): one row per button-triggered
+  exception with timestamp, job name, exception type, message, and the
+  full traceback.
 
 ## Decisions already made — do not re-litigate without asking
 
@@ -38,6 +49,11 @@ These were explicitly chosen by the user in the planning conversations
 it as a question rather than changing the implementation.
 
 - **Indexes**: SP500, NIKKEI225, FTSE100, DAX, CAC40, BEL20, ESTOXX50.
+- **ETFs**: curated list of 38 (one per index, eleven sector SPDRs,
+  twenty single-country iShares MSCI funds). See `ETF_LIST` in
+  `stocks_report.py`. Flow through `aggregate_constituents()` alongside
+  index constituents and get the same .info / price / hyperlink
+  treatment as stocks. ETFs are included in test-mode runs too.
 - **FX**: today's rate, applied to ALL historical prices. User chose this
   over historical rates. Trade-off accepted: mixes price movement with FX
   movement on non-EUR stocks.
@@ -56,17 +72,36 @@ it as a question rather than changing the implementation.
   (`/v1/finance/screener/predefined/saved`, with cookie+crumb auth) and
   dataroma.com (plain HTML "super investor" 13F aggregator) for watchlist
   memberships. All free, no accounts or API keys.
-- **Test mode**: a single cell (`Main!B5`, named `TestMode` in
-  `MAIN_CELLS`) gates whether each job processes the full universe or just
-  BEL20 + 1 quote. CLI `--test` flag is an explicit override; without it,
-  both jobs read the cell. Test mode reduces a 10-min full rebuild to ~40s.
-- **Buttons**: Excel form controls assigned to VBA macros that call
-  `RunPython` via the xlwings add-in. Buttons are added by
-  `setup-buttons`; VBA module is imported once by the user via Alt+F11
-  (programmatic VBA injection needs Excel's "Trust access to VBA project
-  object model" setting, which we can't toggle).
+- **Test mode**: a real Excel form-control checkbox in `Main` with its
+  LinkedCell set to `Main!B5` (the address tracked by `MAIN_CELLS["TestMode"]`).
+  Excel writes TRUE/FALSE into that cell as the user toggles it.
+  `read_test_mode()` accepts TRUE/FALSE/Yes/Y/1/bool. CLI `--test` flag is
+  an explicit override; without it, both jobs read the cell. Test mode
+  reduces a 10-min full rebuild to ~60s (BEL20 ~20 + ETFs 38 = ~58 rows).
+- **Buttons**: Excel form controls (left=720, anchored upper-right to
+  clear column A + B) assigned to VBA macros that call `RunPython` via
+  the xlwings add-in. Buttons + checkbox are added by `setup-buttons`;
+  VBA module is imported once by the user via Alt+F11 (programmatic VBA
+  injection needs Excel's "Trust access to VBA project object model"
+  setting, which we can't toggle).
 - **Live progress feedback**: xlwings writes ticker counts to
   `Main!Status` (`Main!B6`) directly while the job runs.
+- **Idempotent init-workbook**: re-running `init-workbook` on an existing
+  file does NOT overwrite user cosmetic edits — label text, fonts, column
+  widths the user has changed all survive. Only label cells with
+  None-values get filled, and column widths are reset only on fresh
+  creation. Same idea on `_layout_market_sheet`.
+- **Market!Symbol hyperlinks**: every Symbol cell is hyperlinked to
+  `https://finance.yahoo.com/quote/{symbol}`. Both rebuild paths attach
+  the hyperlink; cell value stays plain text so sorting / filtering /
+  `_market_col` lookups keep working.
+- **Error reporting**: button-triggered failures land in THREE places
+  (no truncated VBA MsgBox): `stocks_errors.log` next to the workbook
+  (full traceback, append-only), an `Errors` sheet inside the workbook
+  (one row per failure with timestamp, job, exception, message, tb),
+  and a concise `Main!Status` cell summary with a hint pointing at both.
+  The `_handle_button_exception()` helper does this; each write is
+  wrapped in try/except so the handler itself never crashes.
 
 ## Watchlists tracked
 
@@ -110,14 +145,17 @@ positions aggregate).
 ## Code structure (in `stocks_report.py`)
 
 1. Logging.
-2. Config: `INDEX_WIKI`, `WATCHLISTS`, `DATAROMA_ACTIVIST_CODES`,
-   `FX_PAIRS`, `LOOKBACKS`, `INDEX_DEFAULT_CCY`,
-   `DEFAULT_WORKBOOK_PATH`.
-3. `normalize_ticker()` / `_parse_bel20_ticker()` — Wikipedia → Yahoo
-   per index, including BEL20's "Euronext Brussels:\xa0SYMBOL" parsing.
-4. `get_index_constituents()` / `aggregate_constituents()` — Wikipedia
-   table fetcher, then per-Symbol aggregation with comma-joined
-   `Indexes`.
+2. Config: `INDEX_WIKI`, `ETF_LIST`, `WATCHLISTS`,
+   `DATAROMA_ACTIVIST_CODES`, `FX_PAIRS`, `LOOKBACKS`,
+   `INDEX_DEFAULT_CCY`, `DEFAULT_WORKBOOK_PATH`, `YAHOO_QUOTE_URL`,
+   `ERROR_LOG_FILENAME`, `ERRORS_SHEET_NAME`.
+3. `normalize_ticker()` / `_parse_bel20_ticker()` /
+   `_parse_nikkei225_components()` — Wikipedia → Yahoo per index,
+   including BEL20's "Euronext Brussels:\xa0SYMBOL" parsing and the
+   bullet-list scrape for Nikkei (which no longer publishes a table).
+4. `get_index_constituents()` / `get_etfs()` / `aggregate_constituents()`
+   — Wikipedia table fetcher + curated ETF DataFrame, then per-Symbol
+   aggregation with comma-joined `Indexes`.
 5. `fetch_yahoo_screener()`, `fetch_dataroma_tickers()`,
    `fetch_dataroma_activist_aggregate()`, `fetch_all_watchlists()` —
    Yahoo predefined-screener API (cookie+crumb) plus dataroma.com
@@ -132,23 +170,32 @@ positions aggregate).
 11. `build_report()` + `write_excel()` — legacy single-shot mode
     (`stocks_report.py run`).
 12. `MARKET_COLUMNS`, `MAIN_CELLS`, `PORTFOLIO_*` — workbook layout
-    constants. `_layout_main_sheet()`, `_layout_market_sheet()`,
-    `init_workbook()`.
+    constants. `_layout_main_sheet(overwrite=True/False)`,
+    `_layout_market_sheet(overwrite=True/False)`, `init_workbook()`.
 13. `read_test_mode()`, `read_portfolio_symbols()`, `_owned_for()`,
-    `_market_col()`, `_load_xl()`, `_resolve_workbook()` — workbook
-    helpers.
-14. `button_rebuild_inventory()` / `button_get_quotes()` — xlwings
-    entry points; use the live workbook for both reads and writes.
-15. `rebuild_inventory()` (Job 1, openpyxl, CLI) and
+    `_market_col()`, `_load_xl()`, `_resolve_workbook()`,
+    `yahoo_quote_url()` — workbook helpers.
+14. `_append_error_log()`, `_handle_button_exception()` — failure path
+    that writes to log file + Errors sheet + Status cell.
+15. `_xw_status()`, `_xw_read_portfolio()`, `_xw_read_test_mode()`,
+    `button_rebuild_inventory()`, `button_get_quotes()` — xlwings entry
+    points; use the live workbook for both reads and writes, attach
+    Yahoo hyperlinks to Symbol cells via COM Hyperlinks.Add.
+16. `rebuild_inventory()` (Job 1, openpyxl, CLI) and
     `get_quotes()` (Job 2, openpyxl, CLI).
-16. CLI subcommands: `init-workbook`, `setup-buttons`, `rebuild-inventory`,
-    `get-quotes`, `run` (legacy).
+17. CLI subcommands: `init-workbook`, `setup-buttons` (also adds the
+    Test-mode checkbox), `rebuild-inventory`, `get-quotes`, `run`
+    (legacy).
 
 Market sheet columns (see `MARKET_COLUMNS`):
 `Symbol | Name | Owned? | Indexes | Sector | Watchlists | Currency |
  Today (EUR) | 1D ago (EUR) | 1W ago (EUR) | 1M ago (EUR) | 6M ago (EUR) |
  1Y ago (EUR) | 5Y ago (EUR) | P/E (TTM) | Forward P/E | Description |
  Last update (UTC) | Last error`
+
+Symbol cells carry a Yahoo Finance hyperlink (`finance.yahoo.com/quote/{sym}`).
+ETF rows have `Indexes` values like `ETF — SP500` or `ETF — Sector:
+Utilities`; otherwise their shape matches stock rows exactly.
 
 ## Non-obvious things to know
 
@@ -159,9 +206,9 @@ Market sheet columns (see `MARKET_COLUMNS`):
 - **Watchlists are US-only**: hedge fund / Berkshire lists contain US tickers. Non-US stocks (BEL/CAC/DAX/FTSE/Nikkei/ESTOXX50) will always have empty `Watchlists` column. This is expected, not a bug.
 - **Watchlist matching uses both the full Yahoo symbol AND the suffix-stripped root** — defensive in case a watchlist surfaces a name differently.
 - **One row per Symbol with multi-index membership**: `aggregate_constituents()` collapses Wikipedia per-index constituent DataFrames into a single row per Symbol whose `Indexes` column lists every index that owns it (e.g. SAP.DE → "DAX, ESTOXX50"). The CLI legacy `run` mode and the new Market sheet both use this shape.
-- **Workbook lifecycle**: `init-workbook` creates a vanilla .xlsx via openpyxl (it can't author a valid macro-enabled .xlsm from scratch — Excel rejects the content type). `setup-buttons` opens that .xlsx via Excel COM, adds button shapes + an `xlwings.conf` very-hidden sheet, and SaveAs's to .xlsm. `_resolve_workbook()` auto-routes the daily commands from "stocks.xlsx" to "stocks.xlsm" when the latter exists. `_load_xl()` opens with `keep_vba=True` for .xlsm so user-imported VBA survives every job.
+- **Workbook lifecycle**: `init-workbook` creates a vanilla .xlsx via openpyxl (it can't author a valid macro-enabled .xlsm from scratch — Excel rejects the content type). `setup-buttons` opens that .xlsx via Excel COM, adds button shapes + a test-mode checkbox (LinkedCell=Main!B5) + an `xlwings.conf` very-hidden sheet, and SaveAs's to .xlsm. `_resolve_workbook()` auto-routes the daily commands from "stocks.xlsx" to "stocks.xlsm" when the latter exists. `_load_xl()` opens with `keep_vba=True` for .xlsm so user-imported VBA survives every job. On re-runs `init-workbook` skips writing label cells that already have a value and skips re-applying column widths — protecting user cosmetic edits.
 - **Status cell live updates require xlwings**: openpyxl can't write to a workbook that Excel currently has open. The `button_*` entry points use the xlwings cell API for both reads (portfolio, TestMode) and writes (Status, Market data), so Excel reflects updates instantly. CLI `rebuild_inventory` / `get_quotes` use openpyxl and only log progress to stdout.
-- **`.info` rate limiting**: ~975 calls × 0.25s ≈ 4 min. If Yahoo throttles, the script doesn't crash — those stocks just get blank P/E. Consider caching before scaling up frequency. Both jobs make `.info` calls (rebuild for sector/description/currency/name, get_quotes for trailing+forward P/E).
+- **`.info` rate limiting**: ~1010 calls × 0.25s ≈ 4 min (975 stocks + 38 ETFs). If Yahoo throttles, the script doesn't crash — those stocks just get blank P/E. Consider caching before scaling up frequency. Both jobs make `.info` calls (rebuild for sector/description/currency/name, get_quotes for trailing+forward P/E).
 - **`yf.download()` with multiple tickers** returns a multi-index DataFrame. `fetch_close_prices()` extracts just the `Close` level. Watch for breaking changes across yfinance major versions.
 - **5-year blanks for recent IPOs are correct, not a bug.**
 - **The script is tolerant of partial failures**: a missing watchlist, a failing ticker, or a timed-out chunk all log warnings (or set the per-row Last error column) and the run still completes with the rest.
@@ -256,6 +303,16 @@ smoke test.
 - The two-jobs architecture (`rebuild_inventory` + `get_quotes`) and the
   single persistent `stocks.xlsm`. Substantial deviations require the
   user's say-so.
+- Cosmetic preservation: `init-workbook` re-runs must NOT clobber
+  user-modified label text, fonts, or column widths. The `overwrite`
+  kwarg on `_layout_*` is the protection.
+- The Portfolio is **Symbol + Notes** only (no Quantity column). The
+  user removed Quantity in 2026-05; do not add it back.
+- The Test-mode control is a real Excel checkbox (added by
+  `setup-buttons`) with LinkedCell=Main!B5 — don't replace it with a
+  text cell again.
+- Error reporting is log file + Errors sheet + Status cell. Do NOT
+  re-introduce the truncated VBA MsgBox by re-raising from `button_*`.
 
 ## Conventions
 
