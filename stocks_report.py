@@ -703,6 +703,17 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 
 DEFAULT_WORKBOOK_PATH = Path("stocks.xlsx")
 
+
+def _resolve_workbook(arg_path: str) -> Path:
+    """Auto-upgrade: if the user kept the default 'stocks.xlsx' but
+    'stocks.xlsm' exists (i.e. setup-buttons has been run), use the xlsm.
+    Saves the user from having to pass --workbook stocks.xlsm everywhere.
+    """
+    p = Path(arg_path)
+    if p == Path("stocks.xlsx") and Path("stocks.xlsm").exists():
+        return Path("stocks.xlsm")
+    return p
+
 # Market sheet column order. Fixed by index — every part of the code that
 # reads/writes Market locates columns by name via this list.
 MARKET_COLUMNS = [
@@ -857,17 +868,25 @@ def _owned_for(symbol: str, portfolio: set[str]) -> str:
     return "No"
 
 
+def _load_xl(path: Path):
+    """load_workbook with keep_vba=True for .xlsm (preserves user-imported VBA)."""
+    if path.suffix.lower() == ".xlsm":
+        return load_workbook(path, keep_vba=True)
+    return load_workbook(path)
+
+
 def init_workbook(path: Path) -> Path:
     """Create or refresh the persistent workbook layout.
 
     Idempotent: if ``path`` exists, this function preserves all user data and
     only re-asserts headers, section labels, and column widths. It will never
-    blow away the portfolio area or the Market data rows.
+    blow away the portfolio area, the Market data rows, or any VBA the user
+    has imported into the workbook.
     """
     path = Path(path)
     if path.exists():
         log.info(f"Refreshing workbook layout in {path} (data preserved)")
-        wb = load_workbook(path)
+        wb = _load_xl(path)
         main_ws = wb["Main"] if "Main" in wb.sheetnames else wb.create_sheet("Main", 0)
         market_ws = wb["Market"] if "Market" in wb.sheetnames else wb.create_sheet("Market", 1)
     else:
@@ -932,7 +951,7 @@ def rebuild_inventory(
 
     t0 = time.time()
     _say("Reading portfolio from Main")
-    wb = load_workbook(workbook_path)
+    wb = _load_xl(workbook_path)
     if test_mode is None:
         test_mode = read_test_mode(wb["Main"])
     if test_mode:
@@ -1010,6 +1029,227 @@ def rebuild_inventory(
 
 
 # ---------------------------------------------------------------------------
+# xlwings entry points — called from VBA buttons in stocks.xlsm
+# ---------------------------------------------------------------------------
+#
+# These functions:
+#   * Use xlwings to read state from / write cells to the OPEN workbook
+#     (openpyxl can't write to a file Excel has open).
+#   * Stream "Status:" cell updates so the user sees live progress.
+#   * Share the network fetchers (get_index_constituents, fetch_all_watchlists,
+#     fetch_all_info) with the CLI rebuild_inventory / get_quotes paths.
+#
+# Wiring: VBA module stocks_picker.bas (see vba/) calls
+#   RunPython "import stocks_report; stocks_report.button_rebuild_inventory()"
+# from each macro. The user imports stocks_picker.bas once via Alt+F11, then
+# assigns macros to button shapes via right-click → Assign Macro.
+
+def _xw_status(main_sheet) -> Callable[[str], None]:
+    """Status writer that updates Main!Status live. Truncated to fit one cell."""
+    addr = MAIN_CELLS["Status"]
+    def _set(msg: str) -> None:
+        main_sheet.range(addr).value = msg[:200]
+    return _set
+
+
+def _xw_read_portfolio(main_sheet) -> set[str]:
+    out: set[str] = set()
+    for r in range(PORTFOLIO_FIRST_ROW, PORTFOLIO_LAST_ROW + 1):
+        v = main_sheet.range((r, 1)).value
+        if v is None:
+            continue
+        sym = str(v).strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _xw_read_test_mode(main_sheet) -> bool:
+    raw = main_sheet.range(MAIN_CELLS["TestMode"]).value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().upper() in _TEST_MODE_TRUTHY
+
+
+def button_rebuild_inventory() -> None:
+    """Entry point for the Excel "Rebuild Inventory" button."""
+    import xlwings as xw
+    wb = xw.Book.caller()
+    main = wb.sheets["Main"]
+    market = wb.sheets["Market"]
+    status = _xw_status(main)
+
+    try:
+        test_mode = _xw_read_test_mode(main)
+        indexes = ["BEL20"] if test_mode else list(INDEX_WIKI.keys())
+        status(f"rebuild: starting ({'TEST: BEL20' if test_mode else 'full'})")
+
+        portfolio = _xw_read_portfolio(main)
+        status(f"Portfolio entries: {len(portfolio)}")
+
+        status("Fetching index constituents…")
+        constituents = aggregate_constituents([get_index_constituents(idx) for idx in indexes])
+        status(f"Total unique tickers: {len(constituents)}")
+
+        status("Fetching watchlists…")
+        wl_membership = fetch_all_watchlists()
+
+        status(f"Fetching .info for {len(constituents)} tickers (slow step)")
+
+        def info_progress(done: int, total: int, sym: str) -> None:
+            if done == 1 or done == total or done % 10 == 0:
+                status(f"info {done}/{total} — {sym}")
+
+        info_map = fetch_all_info(list(constituents["Symbol"]),
+                                  delay=0.25, progress=info_progress)
+
+        status("Building rows…")
+        rows = []
+        for _, c in constituents.iterrows():
+            sym = c["Symbol"]
+            info = info_map.get(sym, {})
+            sym_root = re.sub(r"\.[A-Z]{1,3}$", "", sym)
+            labels: list[str] = []
+            for key in {sym, sym_root}:
+                labels.extend(wl_membership.get(key, []))
+            seen = set()
+            labels_dedup = [x for x in labels if not (x in seen or seen.add(x))]
+            first_index = c["Indexes"].split(",")[0].strip()
+            ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(first_index, "")
+            row = [None] * len(MARKET_COLUMNS)
+            row[MARKET_COLUMNS.index("Symbol")]      = sym
+            row[MARKET_COLUMNS.index("Name")]        = info.get("longName") or c["Name"]
+            row[MARKET_COLUMNS.index("Owned?")]      = _owned_for(sym, portfolio)
+            row[MARKET_COLUMNS.index("Indexes")]     = c["Indexes"]
+            row[MARKET_COLUMNS.index("Sector")]      = info.get("sector") or ""
+            row[MARKET_COLUMNS.index("Watchlists")]  = ", ".join(labels_dedup)
+            row[MARKET_COLUMNS.index("Currency")]    = ccy
+            row[MARKET_COLUMNS.index("Description")] = info.get("description") or ""
+            rows.append(row)
+
+        status(f"Writing {len(rows)} rows to Market…")
+        # Clear existing data rows
+        last_row = market.used_range.last_cell.row
+        if last_row >= 2:
+            market.range(f"A2:{get_column_letter(len(MARKET_COLUMNS))}{last_row}").clear_contents()
+        # Bulk write — single COM call
+        if rows:
+            market.range((2, 1)).value = rows
+
+        now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        main.range(MAIN_CELLS["LastRebuildAt"]).value = now_iso
+        main.range(MAIN_CELLS["MarketRowCount"]).value = len(rows)
+        status(f"rebuild: done. {len(rows)} rows at {now_iso}.")
+    except Exception as e:
+        status(f"ERROR: {type(e).__name__}: {e}"[:200])
+        raise
+
+
+def button_get_quotes() -> None:
+    """Entry point for the Excel "Get Quotes" button."""
+    import xlwings as xw
+    wb = xw.Book.caller()
+    main = wb.sheets["Main"]
+    market = wb.sheets["Market"]
+    status = _xw_status(main)
+
+    try:
+        test_mode = _xw_read_test_mode(main)
+        status(f"quotes: starting (test_mode={test_mode})")
+
+        # Read current Market: pull Symbol + Currency + Indexes into a list
+        last_row = market.used_range.last_cell.row
+        if last_row < 2:
+            status("Market is empty — run Rebuild Inventory first")
+            return
+
+        sym_col = MARKET_COLUMNS.index("Symbol") + 1
+        ccy_col = MARKET_COLUMNS.index("Currency") + 1
+        idx_col = MARKET_COLUMNS.index("Indexes") + 1
+
+        market_rows: list[tuple[int, str, str, str]] = []
+        # Bulk-read all three columns in one shot
+        syms = market.range((2, sym_col), (last_row, sym_col)).value
+        ccys = market.range((2, ccy_col), (last_row, ccy_col)).value
+        idxs = market.range((2, idx_col), (last_row, idx_col)).value
+        # When the range is a single cell xlwings returns a scalar, not a list
+        if not isinstance(syms, list): syms = [syms]
+        if not isinstance(ccys, list): ccys = [ccys]
+        if not isinstance(idxs, list): idxs = [idxs]
+        for offset, (s, c, i) in enumerate(zip(syms, ccys, idxs)):
+            if not s:
+                continue
+            market_rows.append((2 + offset, str(s).strip(), str(c or ""), str(i or "")))
+
+        portfolio = _xw_read_portfolio(main)
+        if test_mode:
+            picked = _pick_test_target(market_rows, portfolio)
+            targets = [picked] if picked else []
+            if not targets:
+                status("Test mode: could not pick a target")
+                return
+            status(f"Test mode: refreshing {targets[0][1]} only")
+        else:
+            targets = market_rows
+
+        status("Fetching FX rates")
+        fx = get_fx_rates()
+
+        status(f"Downloading price history for {len(targets)} tickers")
+        today = dt.date.today()
+        start = today - dt.timedelta(days=int(5.2 * 365))
+        end   = today + dt.timedelta(days=1)
+        closes = fetch_close_prices([t[1] for t in targets], start, end)
+
+        status(f"Fetching .info for {len(targets)} tickers (P/E)")
+
+        def info_progress(done: int, total: int, sym: str) -> None:
+            if done == 1 or done == total or done % 10 == 0:
+                status(f"quotes {done}/{total} — {sym}")
+
+        info_map = fetch_all_info([t[1] for t in targets], delay=0.25, progress=info_progress)
+
+        status(f"Writing quote columns for {len(targets)} rows…")
+        now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+
+        ok = 0
+        fail = 0
+        for (row_idx, sym, ccy, _idx) in targets:
+            try:
+                series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
+                for label, delta in LOOKBACKS.items():
+                    target_d = today - delta
+                    native = price_at_or_before(series, target_d)
+                    market.range((row_idx, cols[f"{label} (EUR)"])).value = to_eur(native, ccy, fx)
+                info = info_map.get(sym, {})
+                market.range((row_idx, cols["P/E (TTM)"])).value   = info.get("trailingPE")
+                market.range((row_idx, cols["Forward P/E"])).value = info.get("forwardPE")
+                market.range((row_idx, cols["Last update (UTC)"])).value = now_iso
+                market.range((row_idx, cols["Last error"])).value = None
+                ok += 1
+            except Exception as e:
+                market.range((row_idx, cols["Last error"])).value = f"{type(e).__name__}: {e}"[:300]
+                fail += 1
+
+        main.range(MAIN_CELLS["LastQuotesAt"]).value = now_iso
+        if not test_mode:
+            if fx.get("USD") is not None and not pd.isna(fx["USD"]):
+                main.range(MAIN_CELLS["EurUsd"]).value = float(fx["USD"])
+            if fx.get("JPY") is not None and not pd.isna(fx["JPY"]):
+                main.range(MAIN_CELLS["EurJpy"]).value = float(fx["JPY"])
+            if fx.get("GBP") is not None and not pd.isna(fx["GBP"]):
+                main.range(MAIN_CELLS["EurGbp"]).value = float(fx["GBP"])
+
+        status(f"quotes: done. {ok} ok, {fail} failed at {now_iso}.")
+    except Exception as e:
+        status(f"ERROR: {type(e).__name__}: {e}"[:200])
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Job 2: get_quotes — refresh price and P/E columns daily
 # ---------------------------------------------------------------------------
 
@@ -1076,7 +1316,7 @@ def get_quotes(
                 log.debug(f"status callback raised: {e}")
 
     t0 = time.time()
-    wb = load_workbook(workbook_path)
+    wb = _load_xl(workbook_path)
     main_ws = wb["Main"]
     market_ws = wb["Market"]
     if test_mode is None:
@@ -1191,11 +1431,95 @@ def _cmd_init_workbook(args) -> int:
     return 0
 
 
+def _cmd_setup_buttons(args) -> int:
+    """One-time: convert the workbook to .xlsm and add buttons + xlwings.conf sheet.
+
+    Requires Excel + xlwings. The user still needs to import vba/stocks_picker.bas
+    once via Alt+F11 — programmatic VBA injection needs Excel's "Trust access to
+    the VBA project object model" setting, which we can't toggle here.
+
+    Flow:
+      - Source: whichever workbook --workbook points at (default stocks.xlsx).
+      - Target: same basename with .xlsm extension.
+      - On success, the source .xlsx is removed (unless source IS already .xlsm).
+    """
+    import xlwings as xw
+
+    src = Path(args.workbook).resolve()
+    if not src.exists():
+        log.error(f"Workbook {src} does not exist. Run init-workbook first.")
+        return 1
+    target = src.with_suffix(".xlsm")
+
+    log.info(f"Opening {src} in Excel (headless)")
+    app = xw.App(visible=False, add_book=False)
+    try:
+        wb = app.books.open(str(src))
+        main = wb.sheets["Main"]
+
+        # 1. Add xlwings.conf sheet (used by xlwings to find Python interpreter).
+        if "xlwings.conf" not in [s.name for s in wb.sheets]:
+            conf = wb.sheets.add("xlwings.conf", after=wb.sheets[wb.sheets.count - 1])
+        else:
+            conf = wb.sheets["xlwings.conf"]
+        interpreter = (Path.cwd() / ".venv" / "Scripts" / "python.exe").resolve()
+        pythonpath = Path.cwd().resolve()
+        conf_rows = [
+            ["INTERPRETER_WIN", str(interpreter)],
+            ["PYTHONPATH",      str(pythonpath)],
+            ["SHOW CONSOLE",    "False"],
+        ]
+        conf.range("A1").value = conf_rows
+        try:
+            conf.api.Visible = 2  # xlSheetVeryHidden (only visible via VBA editor)
+        except Exception:
+            pass
+
+        # 2. Remove any existing buttons we added previously (idempotent).
+        for shp in list(main.shapes):
+            if shp.name.startswith("StockPicker_"):
+                shp.delete()
+
+        # 3. Add two buttons in the Jobs section. AddFormControl(1, left, top, w, h)
+        #    where 1 = msoFormControlButton.
+        sheet_api = main.api
+        btn1 = sheet_api.Shapes.AddFormControl(1, 250, 50, 130, 28)
+        btn1.Name = "StockPicker_Rebuild"
+        btn1.TextFrame.Characters.Text = "Rebuild Inventory"
+        btn1.OnAction = "RebuildInventory"
+        btn2 = sheet_api.Shapes.AddFormControl(1, 250, 82, 130, 28)
+        btn2.Name = "StockPicker_GetQuotes"
+        btn2.TextFrame.Characters.Text = "Get Quotes"
+        btn2.OnAction = "GetQuotes"
+
+        # 4. SaveAs .xlsm (FileFormat 52 = xlOpenXMLWorkbookMacroEnabled).
+        if target.exists() and target != src:
+            target.unlink()  # Excel SaveAs refuses to overwrite without prompts in headless mode
+        wb.api.SaveAs(str(target), FileFormat=52)
+        wb.close()
+
+        # Remove the source .xlsx if it's distinct from the .xlsm target.
+        if src != target and src.exists():
+            src.unlink()
+
+        log.info(f"setup-buttons: workbook saved as {target}")
+        log.info("")
+        log.info("Final manual step (one-time):")
+        log.info(f"  1. Open {target.name} in Excel.")
+        log.info("  2. Press Alt+F11 -> File -> Import File -> select vba/stocks_picker.bas.")
+        log.info("  3. Save (the buttons will now respond to clicks).")
+        log.info("")
+        log.info("Also run once: `xlwings addin install` (from any terminal).")
+        return 0
+    finally:
+        app.quit()
+
+
 def _cmd_get_quotes(args) -> int:
     """Job 2 — refresh quote columns (prices + P/E) for every Market row."""
     # --test forces test mode; without it, the workbook's TestMode cell decides.
     return get_quotes(
-        workbook_path=Path(args.workbook),
+        workbook_path=_resolve_workbook(args.workbook),
         test_mode=True if args.test else None,
         info_delay=args.info_delay,
     )
@@ -1213,7 +1537,7 @@ def _cmd_rebuild_inventory(args) -> int:
             log.error(f"Valid: {list(INDEX_WIKI.keys())}")
             return 2
     return rebuild_inventory(
-        workbook_path=Path(args.workbook),
+        workbook_path=_resolve_workbook(args.workbook),
         indexes=indexes,
         info_delay=args.info_delay,
         test_mode=True if args.test else None,
@@ -1227,9 +1551,19 @@ def main() -> int:
     # init-workbook — create or refresh the persistent workbook
     p_init = sub.add_parser(
         "init-workbook",
-        help="Create or refresh stocks.xlsx with Main + Market sheet templates.",
+        help="Create or refresh stocks.xlsm with Main + Market sheet templates.",
     )
     p_init.add_argument(
+        "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
+        help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
+    )
+
+    # setup-buttons — one-time: add Excel buttons + xlwings.conf sheet
+    p_setup = sub.add_parser(
+        "setup-buttons",
+        help="One-time: add Excel buttons + xlwings.conf sheet to the workbook.",
+    )
+    p_setup.add_argument(
         "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
         help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
     )
@@ -1295,7 +1629,7 @@ def main() -> int:
     # Legacy compat: when called as `stocks_report.py --indexes BEL20` with
     # no subcommand, fall back to the run subparser. Detect by looking for
     # a known top-level flag.
-    known_subcommands = {"init-workbook", "rebuild-inventory", "get-quotes", "run", "-h", "--help"}
+    known_subcommands = {"init-workbook", "setup-buttons", "rebuild-inventory", "get-quotes", "run", "-h", "--help"}
     raw_args = sys.argv[1:]
     if raw_args and raw_args[0] not in known_subcommands:
         raw_args = ["run", *raw_args]
@@ -1307,8 +1641,12 @@ def main() -> int:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
         return _cmd_legacy_run(args)
+
+
     if args.cmd == "init-workbook":
         return _cmd_init_workbook(args)
+    if args.cmd == "setup-buttons":
+        return _cmd_setup_buttons(args)
     if args.cmd == "rebuild-inventory":
         return _cmd_rebuild_inventory(args)
     if args.cmd == "get-quotes":
