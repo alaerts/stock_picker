@@ -983,6 +983,154 @@ def rebuild_inventory(
 
 
 # ---------------------------------------------------------------------------
+# Job 2: get_quotes — refresh price and P/E columns daily
+# ---------------------------------------------------------------------------
+
+def _read_market_symbols(market_ws: Worksheet) -> list[tuple[int, str, str, str]]:
+    """Iterate Market data rows. Returns ``[(row_idx, symbol, currency, indexes), ...]``."""
+    sym_c = _market_col("Symbol")
+    ccy_c = _market_col("Currency")
+    idx_c = _market_col("Indexes")
+    out: list[tuple[int, str, str, str]] = []
+    for r in range(2, market_ws.max_row + 1):
+        sym = market_ws.cell(row=r, column=sym_c).value
+        if not sym:
+            continue
+        ccy = market_ws.cell(row=r, column=ccy_c).value or ""
+        idxs = market_ws.cell(row=r, column=idx_c).value or ""
+        out.append((r, str(sym).strip(), str(ccy), str(idxs)))
+    return out
+
+
+def _pick_test_target(
+    market_rows: list[tuple[int, str, str, str]],
+    portfolio: set[str],
+) -> Optional[tuple[int, str, str, str]]:
+    """Test-mode target: top portfolio entry that exists in Market, else first
+    BEL20 row, else first Market row."""
+    if portfolio:
+        # User may have typed "KBC" (root) or "KBC.BR" (full Yahoo) in Main.
+        # Market always stores the full Yahoo form. Match either direction.
+        for sym in sorted(portfolio):
+            for row in market_rows:
+                market_sym = row[1].upper()
+                market_root = re.sub(r"\.[A-Z]{1,3}$", "", market_sym)
+                if market_sym == sym or market_root == sym:
+                    return row
+    for row in market_rows:
+        if "BEL20" in row[3]:
+            return row
+    return market_rows[0] if market_rows else None
+
+
+def get_quotes(
+    workbook_path: Path,
+    test_mode: bool = False,
+    info_delay: float = 0.25,
+    status: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Refresh quote columns in Market for every Symbol (or one in test mode).
+
+    Sets per-row "Last update (UTC)" on success and "Last error" on failure;
+    successful refresh clears any previous error.
+    """
+    workbook_path = Path(workbook_path)
+    if not workbook_path.exists():
+        log.error(f"Workbook {workbook_path} does not exist. Run init-workbook + rebuild-inventory first.")
+        return 1
+
+    def _say(msg: str) -> None:
+        log.info(msg)
+        if status is not None:
+            try:
+                status(msg)
+            except Exception as e:
+                log.debug(f"status callback raised: {e}")
+
+    t0 = time.time()
+    _say(f"get_quotes: starting (test_mode={test_mode})")
+
+    wb = load_workbook(workbook_path)
+    main_ws = wb["Main"]
+    market_ws = wb["Market"]
+    portfolio = read_portfolio_symbols(main_ws)
+    market_rows = _read_market_symbols(market_ws)
+
+    if not market_rows:
+        log.error("Market sheet is empty. Run rebuild-inventory first.")
+        return 1
+
+    if test_mode:
+        picked = _pick_test_target(market_rows, portfolio)
+        if picked is None:
+            log.error("Could not pick a test target.")
+            return 1
+        targets = [picked]
+        _say(f"Test mode: refreshing {targets[0][1]} only")
+    else:
+        targets = market_rows
+
+    _say("Fetching FX rates")
+    fx = get_fx_rates()
+
+    _say(f"Downloading price history for {len(targets)} tickers")
+    today = dt.date.today()
+    start = today - dt.timedelta(days=int(5.2 * 365))
+    end   = today + dt.timedelta(days=1)
+    closes = fetch_close_prices([t[1] for t in targets], start, end)
+
+    _say(f"Fetching .info for {len(targets)} tickers (P/E)")
+
+    def info_progress(done: int, total: int, sym: str) -> None:
+        if status is not None and (done == 1 or done == total or done % 25 == 0):
+            status(f"quotes {done}/{total} — {sym}")
+
+    info_map = fetch_all_info([t[1] for t in targets], delay=info_delay, progress=info_progress)
+
+    _say("Writing quote columns")
+    now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cols = {name: _market_col(name) for name in MARKET_COLUMNS}
+
+    successes = 0
+    failures = 0
+    for (row_idx, sym, ccy, _indexes) in targets:
+        try:
+            series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
+            for label, delta in LOOKBACKS.items():
+                target = today - delta
+                native = price_at_or_before(series, target)
+                market_ws.cell(row=row_idx, column=cols[f"{label} (EUR)"],
+                               value=to_eur(native, ccy, fx))
+            info = info_map.get(sym, {})
+            market_ws.cell(row=row_idx, column=cols["P/E (TTM)"],   value=info.get("trailingPE"))
+            market_ws.cell(row=row_idx, column=cols["Forward P/E"], value=info.get("forwardPE"))
+            market_ws.cell(row=row_idx, column=cols["Last update (UTC)"], value=now_iso)
+            market_ws.cell(row=row_idx, column=cols["Last error"], value=None)  # clear previous
+            successes += 1
+        except Exception as e:
+            market_ws.cell(row=row_idx, column=cols["Last error"], value=f"{type(e).__name__}: {e}"[:300])
+            failures += 1
+            log.warning(f"  {sym}: {e}")
+
+    # Update Main metadata
+    main_ws[MAIN_CELLS["LastQuotesAt"]] = now_iso
+    if not test_mode:
+        # Don't overwrite the headline FX values in test mode — they only describe
+        # a 1-symbol run which is rarely interesting.
+        if fx.get("USD") is not None and not pd.isna(fx["USD"]):
+            main_ws[MAIN_CELLS["EurUsd"]] = float(fx["USD"])
+        if fx.get("JPY") is not None and not pd.isna(fx["JPY"]):
+            main_ws[MAIN_CELLS["EurJpy"]] = float(fx["JPY"])
+        if fx.get("GBP") is not None and not pd.isna(fx["GBP"]):
+            main_ws[MAIN_CELLS["EurGbp"]] = float(fx["GBP"])
+
+    wb.save(workbook_path)
+    duration = time.time() - t0
+    _say(f"get_quotes: done in {duration:.0f}s. {successes} ok, {failures} failed.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1011,6 +1159,15 @@ def _cmd_init_workbook(args) -> int:
     """Create or refresh stocks.xlsx with Main + Market sheet templates."""
     init_workbook(Path(args.workbook))
     return 0
+
+
+def _cmd_get_quotes(args) -> int:
+    """Job 2 — refresh quote columns (prices + P/E) for every Market row."""
+    return get_quotes(
+        workbook_path=Path(args.workbook),
+        test_mode=args.test,
+        info_delay=args.info_delay,
+    )
 
 
 def _cmd_rebuild_inventory(args) -> int:
@@ -1044,6 +1201,24 @@ def main() -> int:
     p_init.add_argument(
         "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
         help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
+    )
+
+    # get-quotes — Job 2 (refresh prices + P/E + per-row last update/error)
+    p_quotes = sub.add_parser(
+        "get-quotes",
+        help="Job 2: refresh quote columns in the Market sheet (run daily).",
+    )
+    p_quotes.add_argument(
+        "--workbook", default=str(DEFAULT_WORKBOOK_PATH),
+        help=f"Workbook path (default: {DEFAULT_WORKBOOK_PATH})",
+    )
+    p_quotes.add_argument(
+        "--info-delay", type=float, default=0.25,
+        help="Seconds between yfinance .info calls (default: 0.25)",
+    )
+    p_quotes.add_argument(
+        "--test", action="store_true",
+        help="Test mode: refresh 1 symbol only (top of Main portfolio or first BEL20).",
     )
 
     # rebuild-inventory — Job 1 (no quotes; populates Market structural data)
@@ -1089,7 +1264,7 @@ def main() -> int:
     # Legacy compat: when called as `stocks_report.py --indexes BEL20` with
     # no subcommand, fall back to the run subparser. Detect by looking for
     # a known top-level flag.
-    known_subcommands = {"init-workbook", "rebuild-inventory", "run", "-h", "--help"}
+    known_subcommands = {"init-workbook", "rebuild-inventory", "get-quotes", "run", "-h", "--help"}
     raw_args = sys.argv[1:]
     if raw_args and raw_args[0] not in known_subcommands:
         raw_args = ["run", *raw_args]
@@ -1105,6 +1280,8 @@ def main() -> int:
         return _cmd_init_workbook(args)
     if args.cmd == "rebuild-inventory":
         return _cmd_rebuild_inventory(args)
+    if args.cmd == "get-quotes":
+        return _cmd_get_quotes(args)
 
     parser.print_help()
     return 2

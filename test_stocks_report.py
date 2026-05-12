@@ -15,6 +15,7 @@ from stocks_report import (  # noqa: E402
     _extract_dataroma_tickers,
     _owned_for,
     _parse_bel20_ticker,
+    _pick_test_target,
     aggregate_constituents,
     init_workbook,
     normalize_ticker,
@@ -227,6 +228,40 @@ def test_read_portfolio_symbols_skips_blanks_and_normalizes(tmp_path):
     ws.cell(row=PORTFOLIO_FIRST_ROW + 2, column=1, value="AAPL")
     ws.cell(row=PORTFOLIO_FIRST_ROW + 3, column=1, value="")              # empty string
     assert read_portfolio_symbols(ws) == {"KBC.BR", "AAPL"}
+
+
+# ---------------------------------------------------------------------------
+# _pick_test_target — get-quotes test-mode selection
+# ---------------------------------------------------------------------------
+
+def _market(rows):
+    """rows: list of (row_idx, symbol, currency, indexes_csv)"""
+    return rows
+
+
+def test_pick_test_target_prefers_portfolio_symbol_in_market():
+    rows = _market([(2, "ABI.BR", "EUR", "BEL20"), (3, "AAPL", "USD", "SP500")])
+    assert _pick_test_target(rows, {"AAPL"})[1] == "AAPL"
+
+
+def test_pick_test_target_handles_suffix_stripped_portfolio_entry():
+    """User wrote 'KBC' in Main; Market has 'KBC.BR' — should still match."""
+    rows = _market([(2, "ABI.BR", "EUR", "BEL20"), (3, "KBC.BR", "EUR", "BEL20")])
+    assert _pick_test_target(rows, {"KBC"})[1] == "KBC.BR"
+
+
+def test_pick_test_target_falls_back_to_first_bel20():
+    rows = _market([(2, "AAPL", "USD", "SP500"), (3, "ABI.BR", "EUR", "BEL20")])
+    assert _pick_test_target(rows, set())[1] == "ABI.BR"
+
+
+def test_pick_test_target_falls_back_to_first_row_if_no_bel20():
+    rows = _market([(2, "AAPL", "USD", "SP500"), (3, "GOOGL", "USD", "SP500")])
+    assert _pick_test_target(rows, set())[1] == "AAPL"
+
+
+def test_pick_test_target_returns_none_when_market_empty():
+    assert _pick_test_target([], set()) is None
 
 
 def test_read_portfolio_symbols_ignores_main_section_labels(tmp_path):
