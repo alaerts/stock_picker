@@ -189,7 +189,10 @@ _BEL20_TICKER_RE = re.compile(
 _NIKKEI_TICKER_RE = re.compile(r"\(\s*TYO\s*:\s*([0-9A-Z]{4,5})\s*\)")
 
 
-def _parse_nikkei225_components(html: str) -> pd.DataFrame:
+_NIKKEI225_MIN_COUNT = 150  # safety floor; real value is ~225
+
+
+def _parse_nikkei225_components(html: str, min_count: int = _NIKKEI225_MIN_COUNT) -> pd.DataFrame:
     """Extract (Symbol, Name, Index) rows from the Components section of the
     English Wikipedia Nikkei 225 page.
 
@@ -199,6 +202,10 @@ def _parse_nikkei225_components(html: str) -> pd.DataFrame:
     occasional trailing parenthetical annotations like
     "(Holding company for X)". Tickers can be 4 digits or 4 chars including
     letters (e.g. "543A").
+
+    Raises RuntimeError if the result is implausibly small — protects
+    against a future Wikipedia restructure silently degrading the workbook
+    instead of surfacing as a visible error.
     """
     start = html.find('id="Components"')
     end = html.find('id="Statistics"')
@@ -219,7 +226,13 @@ def _parse_nikkei225_components(html: str) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["Symbol", "Name"])
     df["Symbol"] = df["Symbol"].apply(lambda s: normalize_ticker(s, "NIKKEI225"))
     df["Index"] = "NIKKEI225"
-    return df.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+    df = df.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+    if len(df) < min_count:
+        raise RuntimeError(
+            f"Nikkei 225 parser yielded only {len(df)} constituents "
+            f"(expected ~225, floor {min_count}). Wikipedia layout likely changed."
+        )
+    return df
 
 
 def _parse_bel20_ticker(cell: str) -> str:

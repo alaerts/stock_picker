@@ -111,7 +111,8 @@ _NIKKEI_FIXTURE = """
 
 
 def test_parse_nikkei225_components_extracts_pairs():
-    df = _parse_nikkei225_components(_NIKKEI_FIXTURE)
+    # min_count=0 bypasses the production safety floor since the fixture is tiny.
+    df = _parse_nikkei225_components(_NIKKEI_FIXTURE, min_count=0)
     pairs = list(zip(df["Symbol"], df["Name"]))
     # 5 stocks; sector summary lines and the post-Statistics li are excluded.
     assert pairs == [
@@ -127,7 +128,7 @@ def test_parse_nikkei225_components_extracts_pairs():
 def test_parse_nikkei225_components_ignores_trailing_annotations():
     """Entries like 'Foo (TYO: 9147)(Holding company for Foo)' must still parse."""
     html = '<h2 id="Components">x</h2><li>Foo Corp. (TYO: 9147)(Holding company for Foo)</li><h2 id="Statistics">x</h2>'
-    df = _parse_nikkei225_components(html)
+    df = _parse_nikkei225_components(html, min_count=0)
     assert list(df["Symbol"]) == ["9147.T"]
     assert list(df["Name"]) == ["Foo Corp."]
 
@@ -135,6 +136,14 @@ def test_parse_nikkei225_components_ignores_trailing_annotations():
 def test_parse_nikkei225_components_raises_when_no_components_section():
     with pytest.raises(RuntimeError, match="Components section"):
         _parse_nikkei225_components("<html>no components header</html>")
+
+
+def test_parse_nikkei225_components_raises_when_too_few_results():
+    """Safety net: if a future page change makes the parser yield only a handful
+    of entries, surface as an error rather than silently writing 5 rows."""
+    html = '<h2 id="Components">x</h2><li>Foo (TYO: 9001)</li><h2 id="Statistics">x</h2>'
+    with pytest.raises(RuntimeError, match="Wikipedia layout likely changed"):
+        _parse_nikkei225_components(html)  # uses default min_count=150
 
 
 # ---------------------------------------------------------------------------

@@ -171,12 +171,23 @@ Market sheet columns (see `MARKET_COLUMNS`):
 
 Offline unit tests (no network):
 ```powershell
-.\.venv\Scripts\python.exe -m pytest test_stocks_report.py -v
+.\.venv\Scripts\python.exe -m pytest -v
 ```
 
-78 unit tests cover the parsing/aggregation/lookup logic. All should pass
+84 unit tests cover the parsing/aggregation/lookup logic. All should pass
 before any commit (per the user's commit-cadence rule in
 `~/.claude/projects/.../memory/reference_github_repo.md`).
+
+Live integration tests (hits Wikipedia / Yahoo / dataroma; ~30 sec):
+```powershell
+.\.venv\Scripts\python.exe -m pytest --integration -v
+```
+
+16 integration tests guard against the failure class where an upstream
+source restructures its page and our parser silently breaks — the
+"Could not locate constituent table for NIKKEI225" button error from
+2026-05-12 is the canonical example. Skipped by default; run before any
+release / scheduling change.
 
 End-to-end smoke (test mode = BEL20 + 1 quote, ~40 sec):
 ```powershell
