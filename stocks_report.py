@@ -1946,9 +1946,19 @@ def button_get_quotes() -> None:
         all_records = _read_market_records_xlwings(market)
         winners = _compute_monthly_winners(all_records)
         losers  = _compute_monthly_losers(all_records)
-        status(f"Winners: {len(winners)}, Losers: {len(losers)} (of {len(all_records)} Market rows)")
+        if len(all_records) < 50:
+            status(f"⚠ Market only has {len(all_records)} rows — ranking sparse. "
+                   "Run full rebuild-inventory to seed Market.")
+        # Adaptive filter: skip the Owned?=Yes pre-filter when no owned
+        # losers exist — otherwise the sheet looks empty to the user.
+        has_owned_losers = any(_is_owned(m.get("owned")) for m in losers)
+        status(f"Winners: {len(winners)}, Losers: {len(losers)} "
+               f"(owned: {sum(1 for m in losers if _is_owned(m.get('owned')))})")
         _ensure_ranking_sheet_xlwings(wb, MONTHLY_WINNERS_SHEET_NAME, winners)
-        _ensure_ranking_sheet_xlwings(wb, MONTHLY_LOSERS_SHEET_NAME, losers, filter_owned_yes=True)
+        _ensure_ranking_sheet_xlwings(
+            wb, MONTHLY_LOSERS_SHEET_NAME, losers,
+            filter_owned_yes=has_owned_losers,
+        )
 
         main.range(MAIN_CELLS["LastQuotesAt"]).value = now_iso
         if not test_mode:
@@ -2064,6 +2074,16 @@ RANKING_HEADERS = ["Symbol", "Name", "Owned?", "Indexes", "Sector",
                    "Today (EUR)", "1D %", "1W %", "1M %"]
 MONTHLY_RANKING_TOP_N = 50
 OWNED_COL_INDEX_1BASED = RANKING_HEADERS.index("Owned?") + 1  # 3
+
+
+def _is_owned(owned_value) -> bool:
+    """Interpret the Market!Owned? cell value as a bool. Tolerates None,
+    plain bool, "Yes"/"No" strings, "1"/"0", whitespace."""
+    if owned_value is None:
+        return False
+    if isinstance(owned_value, bool):
+        return owned_value
+    return str(owned_value).strip().lower() in ("yes", "y", "true", "t", "1")
 
 
 def _compute_monthly_winners(records: list[dict],
@@ -2481,9 +2501,20 @@ def get_quotes(
     all_records = _read_market_records_openpyxl(market_ws)
     winners = _compute_monthly_winners(all_records)
     losers  = _compute_monthly_losers(all_records)
-    _say(f"Monthly winners: {len(winners)} qualify; losers: {len(losers)} (out of {len(all_records)} Market rows)")
+    if len(all_records) < 50:
+        _say(f"  ⚠ Market only has {len(all_records)} rows — "
+             "ranking will be sparse. Run a full rebuild-inventory to seed Market properly.")
+    # Adaptive filter: only pre-apply Owned?=Yes if at least one owned loser
+    # exists. Otherwise the filter would hide every row and the sheet looks
+    # empty (the 2026-05-13 user bug).
+    has_owned_losers = any(_is_owned(m.get("owned")) for m in losers)
+    _say(f"Monthly winners: {len(winners)} qualify; losers: {len(losers)} "
+         f"(owned among losers: {sum(1 for m in losers if _is_owned(m.get('owned')))})")
     _ensure_ranking_sheet_openpyxl(wb, MONTHLY_WINNERS_SHEET_NAME, winners)
-    _ensure_ranking_sheet_openpyxl(wb, MONTHLY_LOSERS_SHEET_NAME, losers, filter_owned_yes=True)
+    _ensure_ranking_sheet_openpyxl(
+        wb, MONTHLY_LOSERS_SHEET_NAME, losers,
+        filter_owned_yes=has_owned_losers,
+    )
 
     # Update Main metadata
     main_ws[MAIN_CELLS["LastQuotesAt"]] = now_iso

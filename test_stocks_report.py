@@ -17,6 +17,7 @@ from stocks_report import (  # noqa: E402
     MONTHLY_LOSERS_SHEET_NAME,
     MONTHLY_MOVERS_LEGACY_NAME,
     MONTHLY_WINNERS_SHEET_NAME,
+    OWNED_COL_INDEX_1BASED,
     PORTFOLIO_FIRST_ROW,
     RANKING_HEADERS,
     SCHEMA_VERSION,
@@ -754,6 +755,116 @@ def test_get_quotes_test_mode_populates_ranking_on_unfilled_market(tmp_path, mon
     assert losers.cell(row=2, column=1).value is not None, (
         "Monthly losers is EMPTY after get_quotes test mode — this is the user's bug"
     )
+
+    # In this seed scenario, NO row is marked Owned?=Yes, so the losers
+    # sheet's pre-filter must be UNAPPLIED (otherwise Excel would hide
+    # every loser row and the user would see the sheet as empty — the
+    # actual 2026-05-13 bug).
+    los_filter = losers.auto_filter
+    assert not los_filter.filterColumn, (
+        "Owned?=Yes pre-filter is active but no row is Owned?=Yes — "
+        "Excel will hide every loser and the sheet will look empty"
+    )
+
+
+def test_get_quotes_test_mode_skips_owned_filter_when_no_owned_losers(tmp_path, monkeypatch):
+    """The Owned?=Yes pre-filter on Monthly losers must adapt: if no owned
+    losers exist, skip the pre-filter so the user actually sees the rows.
+    """
+    import datetime as dt
+    import pandas as pd
+    import stocks_report as sr
+    from openpyxl import load_workbook
+    from stocks_report import MONTHLY_LOSERS_SHEET_NAME
+
+    path = tmp_path / "adaptive_filter.xlsx"
+    init_workbook(path)
+    wb = load_workbook(path)
+    market = wb["Market"]
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+    # 10 rows, all Owned?=No, all losers.
+    for r in range(2, 12):
+        sym = f"LOSER{r-2}.X"
+        market.cell(row=r, column=cols["Symbol"], value=sym)
+        market.cell(row=r, column=cols["Name"], value=f"Loser {r-2}")
+        market.cell(row=r, column=cols["Currency"], value="EUR")
+        market.cell(row=r, column=cols["Owned?"], value="No")
+        market.cell(row=r, column=cols["Indexes"], value="X")
+        market.cell(row=r, column=cols["1D %"], value=-0.01)
+        market.cell(row=r, column=cols["1W %"], value=-0.02)
+        market.cell(row=r, column=cols["1M %"], value=-0.05 * (r - 1))
+        market.cell(row=r, column=cols["Today (EUR)"], value=100.0)
+    wb.save(path)
+
+    # Mock network
+    dates = pd.date_range(end=dt.date.today(), periods=400).normalize()
+    monkeypatch.setattr(sr, "fetch_close_prices",
+        lambda tickers, *a, **kw: pd.concat({t: pd.Series([100]*399 + [95], index=dates) for t in tickers}, axis=1))
+    monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw: {t: {} for t in tickers})
+    monkeypatch.setattr(sr, "get_fx_rates", lambda: {"EUR": 1.0, "GBp": 0.85, "USD": 1.1, "JPY": 165, "GBP": 0.85, "CHF": 1.0})
+    monkeypatch.setattr(sr, "get_fx_history",
+        lambda: {ccy: pd.Series(dtype=float) for ccy in ("USD","JPY","GBP","CHF")})
+
+    sr.get_quotes(workbook_path=path, test_mode=True, info_delay=0.0)
+
+    wb2 = load_workbook(path)
+    losers = wb2[MONTHLY_LOSERS_SHEET_NAME]
+    # losers ARE present (refresh produced declining stocks)
+    assert losers.cell(row=2, column=1).value is not None
+    # but pre-filter must be UNAPPLIED since no losers are owned.
+    assert not losers.auto_filter.filterColumn, (
+        "Pre-filter must NOT be applied when no owned losers exist; "
+        "otherwise Excel hides every row and the user sees empty"
+    )
+
+
+def test_get_quotes_test_mode_applies_owned_filter_when_owned_losers_present(tmp_path, monkeypatch):
+    """Conversely: WHEN at least one loser is owned, the pre-filter SHOULD
+    apply so the user immediately sees their declining holdings first."""
+    import datetime as dt
+    import pandas as pd
+    import stocks_report as sr
+    from openpyxl import load_workbook
+    from stocks_report import MONTHLY_LOSERS_SHEET_NAME, OWNED_COL_INDEX_1BASED
+
+    path = tmp_path / "applied_filter.xlsx"
+    init_workbook(path)
+    wb = load_workbook(path)
+    market = wb["Market"]
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+    for r in range(2, 12):
+        sym = f"LOSER{r-2}.X"
+        market.cell(row=r, column=cols["Symbol"], value=sym)
+        market.cell(row=r, column=cols["Name"], value=f"Loser {r-2}")
+        market.cell(row=r, column=cols["Currency"], value="EUR")
+        # First two rows are owned
+        market.cell(row=r, column=cols["Owned?"], value=("Yes" if r <= 3 else "No"))
+        market.cell(row=r, column=cols["Indexes"], value="X")
+        market.cell(row=r, column=cols["1D %"], value=-0.01)
+        market.cell(row=r, column=cols["1W %"], value=-0.02)
+        market.cell(row=r, column=cols["1M %"], value=-0.05 * (r - 1))
+        market.cell(row=r, column=cols["Today (EUR)"], value=100.0)
+    wb.save(path)
+
+    dates = pd.date_range(end=dt.date.today(), periods=400).normalize()
+    monkeypatch.setattr(sr, "fetch_close_prices",
+        lambda tickers, *a, **kw: pd.concat({t: pd.Series([100]*399 + [95], index=dates) for t in tickers}, axis=1))
+    monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw: {t: {} for t in tickers})
+    monkeypatch.setattr(sr, "get_fx_rates", lambda: {"EUR": 1.0, "GBp": 0.85, "USD": 1.1, "JPY": 165, "GBP": 0.85, "CHF": 1.0})
+    monkeypatch.setattr(sr, "get_fx_history",
+        lambda: {ccy: pd.Series(dtype=float) for ccy in ("USD","JPY","GBP","CHF")})
+
+    sr.get_quotes(workbook_path=path, test_mode=True, info_delay=0.0)
+
+    wb2 = load_workbook(path)
+    losers = wb2[MONTHLY_LOSERS_SHEET_NAME]
+    # Pre-filter must be applied on Owned? column
+    assert losers.auto_filter.filterColumn, (
+        "Pre-filter must be applied when at least one owned loser exists"
+    )
+    fc = losers.auto_filter.filterColumn[0]
+    assert fc.colId == OWNED_COL_INDEX_1BASED - 1  # 0-based
+    assert "Yes" in fc.filters.filter
 
 
 def test_rebuild_inventory_test_mode_preserves_market(tmp_path, monkeypatch):
