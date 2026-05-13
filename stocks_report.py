@@ -1456,6 +1456,23 @@ def rebuild_inventory(
 # from each macro. The user imports stocks_picker.bas once via Alt+F11, then
 # assigns macros to button shapes via right-click → Assign Macro.
 
+def _xw_last_visible_sheet(wb_xw):
+    """Return the last VISIBLE sheet in the xlwings workbook.
+
+    xlwings's `sheets.add(after=...)` translates to Excel COM's
+    `Worksheet.Move(After=...)`, which **fails** when the After-target is
+    hidden or very-hidden (the case for our `xlwings.conf` config sheet at
+    the end of the workbook). Picking the last visible sheet sidesteps that.
+    """
+    for s in reversed(list(wb_xw.sheets)):
+        try:
+            if s.api.Visible == -1:  # xlSheetVisible (-1 = visible, 0 hidden, 2 very-hidden)
+                return s
+        except Exception:
+            pass
+    return wb_xw.sheets[0]  # fallback to first sheet — should never get here
+
+
 def _xw_status(main_sheet) -> Callable[[str], None]:
     """Status writer that updates Main!Status live. Truncated to fit one cell."""
     addr = MAIN_CELLS["Status"]
@@ -1489,7 +1506,7 @@ def _handle_button_exception(wb, job_name: str, exc: BaseException, traceback_te
     # 2. Errors sheet (create-if-missing, append a row)
     try:
         if ERRORS_SHEET_NAME not in [s.name for s in wb.sheets]:
-            err = wb.sheets.add(ERRORS_SHEET_NAME, after=wb.sheets[wb.sheets.count - 1])
+            err = wb.sheets.add(ERRORS_SHEET_NAME, after=_xw_last_visible_sheet(wb))
             err.range("A1").value = [[
                 "Timestamp (UTC)", "Job", "Exception", "Message", "Traceback",
             ]]
@@ -1881,7 +1898,7 @@ def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) ->
     """Write/refresh the Currencies sheet using xlwings (button path)."""
     sheet_names = [s.name for s in wb_xw.sheets]
     if CURRENCIES_SHEET_NAME not in sheet_names:
-        cur = wb_xw.sheets.add(CURRENCIES_SHEET_NAME, after=wb_xw.sheets[wb_xw.sheets.count - 1])
+        cur = wb_xw.sheets.add(CURRENCIES_SHEET_NAME, after=_xw_last_visible_sheet(wb_xw))
         is_new = True
     else:
         cur = wb_xw.sheets[CURRENCIES_SHEET_NAME]
@@ -1978,7 +1995,7 @@ def _ensure_monthly_movers_sheet_xlwings(wb_xw, movers: list[dict]) -> None:
     """Write/refresh the Monthly movers sheet via xlwings (button path)."""
     sheet_names = [s.name for s in wb_xw.sheets]
     if MONTHLY_MOVERS_SHEET_NAME not in sheet_names:
-        mv = wb_xw.sheets.add(MONTHLY_MOVERS_SHEET_NAME, after=wb_xw.sheets[wb_xw.sheets.count - 1])
+        mv = wb_xw.sheets.add(MONTHLY_MOVERS_SHEET_NAME, after=_xw_last_visible_sheet(wb_xw))
         is_new = True
     else:
         mv = wb_xw.sheets[MONTHLY_MOVERS_SHEET_NAME]
