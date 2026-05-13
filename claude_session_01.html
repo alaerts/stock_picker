@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude Session 01 — Stock Picker</title>
+<style>
+  :root {
+    --user-bg: #eef5ff;
+    --user-border: #2563eb;
+    --asst-bg: #fafafa;
+    --asst-border: #555;
+    --code-bg: #f4f4f5;
+    --muted: #666;
+    --accent: #1e40af;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 2rem auto;
+    padding: 0 1.5rem 4rem;
+    line-height: 1.55;
+    color: #1f2937;
+    background: #fff;
+  }
+  header.page {
+    border-bottom: 2px solid #1f2937;
+    padding-bottom: 1rem;
+    margin-bottom: 2rem;
+  }
+  header.page h1 {
+    margin: 0 0 0.4rem;
+    font-size: 1.75rem;
+  }
+  header.page .meta {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  nav.toc {
+    background: #fffbea;
+    border: 1px solid #fde68a;
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 2.5rem;
+  }
+  nav.toc h2 {
+    margin: 0 0 0.6rem;
+    font-size: 1.05rem;
+    color: #92400e;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.4rem;
+    columns: 2;
+    column-gap: 2rem;
+  }
+  nav.toc li { margin: 0.15rem 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section.phase {
+    margin: 2.5rem 0 1.5rem;
+  }
+  section.phase > h2 {
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 0.4rem;
+    margin-bottom: 1rem;
+    font-size: 1.3rem;
+    color: #111;
+  }
+  section.phase > .summary {
+    font-style: italic;
+    color: var(--muted);
+    margin-bottom: 1rem;
+  }
+  .turn {
+    margin: 1.2rem 0;
+    padding: 0.9rem 1.2rem;
+    border-radius: 6px;
+    border-left: 4px solid;
+  }
+  .turn.user { background: var(--user-bg); border-color: var(--user-border); }
+  .turn.assistant { background: var(--asst-bg); border-color: var(--asst-border); }
+  .turn .sender {
+    font-weight: 700;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 0.4rem;
+  }
+  .turn p { margin: 0.5rem 0; }
+  .turn ul, .turn ol { margin: 0.4rem 0 0.6rem 0; padding-left: 1.6rem; }
+  code, pre, kbd {
+    font-family: "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 0.08rem 0.32rem;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.85rem 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    line-height: 1.45;
+    font-size: 0.85rem;
+    margin: 0.6rem 0;
+  }
+  pre code { background: transparent; padding: 0; }
+  .commit {
+    display: inline-block;
+    font-family: monospace;
+    background: #e5e7eb;
+    padding: 0.05rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.8em;
+    color: #374151;
+  }
+  table {
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 0.35rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f3f4f6; }
+  .note {
+    background: #fef3c7;
+    border-left: 4px solid #f59e0b;
+    padding: 0.5rem 0.9rem;
+    border-radius: 4px;
+    margin: 0.6rem 0;
+    font-size: 0.92em;
+  }
+  footer.page {
+    margin-top: 4rem;
+    padding-top: 1rem;
+    border-top: 1px solid #ddd;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<header class="page">
+  <h1>Claude Session 01 — Stock Picker</h1>
+  <p class="meta">
+    A multi-day pair-programming session with Claude Opus 4.7 (1M context).
+    Dates: 2026-05-06 → 2026-05-13.
+    Repo: <a href="https://github.com/alaerts/stock_picker">github.com/alaerts/stock_picker</a>.
+  </p>
+</header>
+
+<nav class="toc">
+  <h2>Table of contents</h2>
+  <ol>
+    <li><a href="#p01">BEL 20 smoke test &amp; pandas 3.0 fix</a></li>
+    <li><a href="#p02">Watchlists are broken — investigation</a></li>
+    <li><a href="#p03">Watchlists rebuilt (Yahoo screener + dataroma)</a></li>
+    <li><a href="#p04">GitHub setup, initial commit, cadence rules</a></li>
+    <li><a href="#p05">NEW_FEATURES.md — two-jobs architecture spec</a></li>
+    <li><a href="#p06">Implementing the two-jobs model (Phases 1-9)</a></li>
+    <li><a href="#p07">xlwings setup, RunPython, VBA import</a></li>
+    <li><a href="#p08">First full run — 21 min, 983 rows</a></li>
+    <li><a href="#p09">Cross-index ticker bugs (AIR.PA.DE etc.)</a></li>
+    <li><a href="#p10">Stray tail.exe blocking PC sleep</a></li>
+    <li><a href="#p11">Feature batch: Quantity, buttons, hyperlinks, ETFs</a></li>
+    <li><a href="#p12">Error reporting overhaul (log + Errors sheet + Status)</a></li>
+    <li><a href="#p13">Cosmetic preservation rule</a></li>
+    <li><a href="#p14">Test suite incomplete → xlwings test layer</a></li>
+    <li><a href="#p15">xlwings tests killing user's Excel — skip guard</a></li>
+    <li><a href="#p16">v03: Monthly winners + losers + Owned? + AutoFilter</a></li>
+    <li><a href="#p17">Workbook rename, archives, handoff</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="phase" id="p01">
+  <h2>1 — BEL 20 smoke test &amp; pandas 3.0 fix</h2>
+  <p class="summary">Original goal: get the existing script's BEL 20 smoke test working. It crashed before fetching a single ticker.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Do the BEL 20 smoke test.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Set up a venv with <code>uv</code>, installed requirements. First run crashed at <code>pd.read_html(resp.text)</code> — pandas 3.0 (auto-resolved) no longer accepts literal HTML strings; needs <code>io.StringIO</code> wrap. Fixed.</p>
+    <p>Second run: <code>BEL20: 0 constituents</code>. Investigation: Wikipedia's BEL 20 ticker column reads <code>"Euronext Brussels:&nbsp;ABI"</code> (22 chars including non-breaking space). The script's <code>between(1, 12)</code> length filter discarded every row. Also: APAM is on Euronext Amsterdam → needs <code>.AS</code>, not <code>.BR</code>.</p>
+    <p>Wrote <code>_parse_bel20_ticker</code> to extract the symbol + exchange suffix correctly. Plus a third bug: openpyxl auto-size loop tripping on NaN under pandas 3.0 (<code>str()</code> inside the comprehension fixed it). Plus a fourth: <code>datetime.utcnow()</code> deprecation warning → <code>datetime.now(dt.UTC)</code>.</p>
+    <p>BEL 20 smoke completed in ~13 sec, 20 rows. Watchlist columns all empty for BEL 20 (expected — they're US-only), but <em>also</em> "22 tickers per list" for every Yahoo watchlist looked suspicious...</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p02">
+  <h2>2 — Watchlists are broken — investigation</h2>
+  <p class="summary">The "22 tickers per list" was nav noise. Yahoo deprecated the watchlist pages entirely.</p>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Probed the Berkshire watchlist page: of the 22 tickers it returned, NONE were actual Berkshire holdings (AAPL/BAC/KO all absent). The 22 were sidebar / trending widget tickers scraped from page chrome.</p>
+    <p>Discovery sequence (time-boxed "3a"):</p>
+    <ul>
+      <li>7 of the 8 watchlist URLs returned "Oops, something went wrong" — Yahoo deprecated them.</li>
+      <li>Berkshire still has a hidden <code>scrIds=top_stocks_owned_by_warren_buffet</code> backing it via the screener API.</li>
+      <li>30 guessed scrIds for the hedge-fund variants all returned <code>Not Found</code> — those screeners are gone.</li>
+      <li>Yahoo's public screener catalog has none of the hedge-fund-style lists.</li>
+    </ul>
+    <p>Conclusion: <strong>3b (headless browser) wouldn't help</strong>. The data isn't lazy-loaded; it's gone. Investigation results saved to MEMORY.md.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Try 3a time-boxed. If it fails, go for 3b. Update memory.md</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Presented four paths: <strong>α</strong> (salvage via Yahoo screener), <strong>β</strong> (guess undocumented scrIds), <strong>γ</strong> (alternative source like dataroma), <strong>δ</strong> (drop watchlists). Recommended <em>β → α + γ</em>.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>OK, I agree with your recommendation, go for it</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p03">
+  <h2>3 — Watchlists rebuilt (Yahoo screener + dataroma)</h2>
+  <p class="summary">Slim 6-list mapping replacing the original 8-list spec.</p>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Implemented Yahoo screener API with cookie+crumb auth. Berkshire works (<code>top_stocks_owned_by_warren_buffet</code>) + <code>recent_52_week_highs</code> as a substitute for "Largest 52-Week Gains".</p>
+    <p>For the 4 remaining hedge-fund lists, switched to dataroma.com — plain HTML, the <code>/m/stock.php?sym=X</code> link pattern works across all their pages. Final mapping (Option B):</p>
+    <table>
+      <tr><th>Label</th><th>Source</th><th>Ref</th></tr>
+      <tr><td>Recent 52-Week Highs</td><td>Yahoo screener</td><td><code>recent_52_week_highs</code></td></tr>
+      <tr><td>Berkshire Hathaway Portfolio</td><td>Yahoo screener</td><td><code>top_stocks_owned_by_warren_buffet</code></td></tr>
+      <tr><td>Top Quarterly Buys (Super Investors)</td><td>dataroma</td><td><code>/m/g/portfolio_b.php?q=q&amp;o=c</code></td></tr>
+      <tr><td>Top Quarterly Sells (Super Investors)</td><td>dataroma</td><td><code>/m/g/portfolio_s.php?q=q&amp;o=c</code></td></tr>
+      <tr><td>Most-Held by Super Investors</td><td>dataroma</td><td><code>/m/g/portfolio.php</code></td></tr>
+      <tr><td>Activist Hedge Fund Positions</td><td>dataroma (aggregate)</td><td>holdings of 7 managers (Icahn, Ackman, ValueAct, Trian, Engaged, Third Point, TCI)</td></tr>
+    </table>
+    <p>BEL20+SP500 smoke: 523 rows, 203 SP500 stocks tagged, 76 in multiple lists. 8/9 known Berkshire holdings present.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p04">
+  <h2>4 — GitHub setup, initial commit, cadence rules</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Save everything to https://github.com/alaerts/stock_picker. Commit and push after each major change, and after every set of 5 small changes, with a summary. Tests must pass before committing.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Saved the cadence rule to durable memory. <code>gh auth status</code> showed the repo already exists (empty). <code>git init</code>, added <code>*.log</code> + <code>*.zip</code> + <code>.claude/settings.local.json</code> to <code>.gitignore</code>, initial commit pushed to <code>main</code> — <span class="commit">4694222</span>.</p>
+    <p>The cadence rule was later extended: "<em>Major changes also run <code>pytest --integration</code></em>". Anything touching parsing, scraping, source URLs, workbook layout, or adding/removing a data source counts as major.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p05">
+  <h2>5 — NEW_FEATURES.md — two-jobs architecture spec</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Check the file NEW_FEATURES.md. Suggest enhancements. Propose a plan. Do not build anything yet</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>The file specified:</p>
+    <ul>
+      <li><strong>Two jobs:</strong> Job 1 builds the structural data (slow, weekly). Job 2 refreshes quotes (daily). Output to a "Market" sheet.</li>
+      <li><strong>Persistent workbook</strong> with a "Main" sheet (manual portfolio + buttons + status).</li>
+      <li><strong>Test mode</strong> via a checkbox in Main.</li>
+      <li><strong>Company description, sector, indexes (multi), watchlists.</strong></li>
+    </ul>
+    <p>I proposed: 9 architectural decisions (button trigger mechanism, live progress mechanism, one-row-per-Symbol, workbook update semantics, test-mode semantics, EuroStoxx 50 addition, sector source, filename + path conventions). Plus enhancements: Last-update/Last-error columns, last-run timestamps, idempotent init-workbook, new-tickers-since-last-run indicator, CLI fallback.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Put the metadata on the "Main" sheet. In the "Market" sheet, add a column to indicate whether I own that stock. Rename job 1 into "rebuild_inventory" job, and job 2 into "get_quotes". Trigger Python using xlwings. Show a live ticker count updating during the run. Use one row per Symbol. Add EuroStoxx 50. For the rest, I agree with your choices. Could you build this without prompting me?</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p06">
+  <h2>6 — Implementing the two-jobs model (Phases 1-9)</h2>
+  <p class="summary">9 commits, one per phase, ~2 hours of focused work.</p>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Phase-by-phase commits:</p>
+    <table>
+      <tr><th>Commit</th><th>Phase</th></tr>
+      <tr><td><span class="commit">06e8a25</span></td><td>1: Data model: one row per Symbol with <code>Indexes</code> comma-list</td></tr>
+      <tr><td><span class="commit">f3ac539</span></td><td>2: EuroStoxx 50 index added</td></tr>
+      <tr><td><span class="commit">7115901</span></td><td>3: Sector + description from yfinance .info</td></tr>
+      <tr><td><span class="commit">5073f66</span></td><td>4: <code>init-workbook</code> subcommand</td></tr>
+      <tr><td><span class="commit">c885858</span></td><td>5: <code>rebuild-inventory</code> (Job 1)</td></tr>
+      <tr><td><span class="commit">8c745ab</span></td><td>6: <code>get-quotes</code> (Job 2) with per-row Last update/Last error</td></tr>
+      <tr><td><span class="commit">2770c9f</span></td><td>7: Test mode read from Main!B5 cell</td></tr>
+      <tr><td><span class="commit">3601127</span></td><td>8: xlwings buttons + <code>setup-buttons</code> + live progress feedback</td></tr>
+      <tr><td><span class="commit">81f6a66</span></td><td>9: CLAUDE.md rewritten</td></tr>
+    </table>
+    <p>Bug surfaced on Phase 5: my <code>read_portfolio_symbols</code> iterated rows 5-100 in column A, which collided with the "Jobs / Status / Metadata" section labels I'd written there. Fix: restructured Main so all controls/metadata are <em>above</em> the portfolio area; added a regression test that fails if a fresh workbook returns a non-empty portfolio set.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p07">
+  <h2>7 — xlwings setup, RunPython, VBA import</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p><em>Screenshot of "Sub or Function not defined: RunPython" compile error.</em> I've this error.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Diagnosis: <code>RunPython</code> lives in the xlwings Excel add-in, not in your workbook's VBA project. The add-in was installed (in XLSTART) but the workbook's VBA project needed Tools → References → tick "xlwings". Documented in README's Troubleshooting section.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>It was fixed by adding the explicit VBA reference. Thanks. <br><br>Later: I enabled "Trust access to VBA project object model" setting. What are the risks?</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Explained the risks (malicious macros / COM clients can modify VBA programmatically) and the mitigations (Trust Center "Disable VBA macros with notification" stays the first line of defense; don't click "Enable Content" on untrusted xlsm files). Offered to teach <code>setup-buttons</code> to programmatically import the VBA module now that the setting was on. Built it — <span class="commit">b6a5659</span>.</p>
+    <p>Later hardened the de-dup logic to scan every module for our macro signatures, not just the one named "stocks_picker" — caught the "Ambiguous name detected: RebuildInventory" error when the user's workbook already had a manual import under a different module name. <span class="commit">48edffd</span></p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p08">
+  <h2>8 — First full run — 21 min, 983 rows</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>I made cosmetic changes. Review and obey them from now. Then run the two jobs</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Inspected the workbook: user had cleared A3 + A5, increased row 1 height. Tightened the cosmetic-preservation rule so <code>init-workbook</code> re-runs touch <em>no</em> Main cells (not even ones cleared to <code>None</code>). Regression test added.</p>
+    <p>Ran the jobs via background Bash + Monitor. <code>rebuild-inventory</code>: 631 sec, 983 rows. <code>get-quotes</code>: 646 sec, 983 OK / 0 failed. Total ~21 min.</p>
+    <p>During rebuild, three normalize_ticker bugs surfaced: <code>BT.A.L</code>, <code>AIR.PA.DE</code>, <code>MT.AS.PA</code>. Three bogus rows in Market that 404 on Yahoo.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p09">
+  <h2>9 — Cross-index ticker bugs (AIR.PA.DE etc.)</h2>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Three real bugs in <code>normalize_ticker</code>:</p>
+    <ul>
+      <li><strong>DAX double-suffix:</strong> Airbus's DAX Wikipedia entry is <code>AIR.PA</code>; the DAX rule blindly appended <code>.DE</code> → <code>AIR.PA.DE</code>.</li>
+      <li><strong>CAC40 double-suffix:</strong> ArcelorMittal's CAC40 entry is <code>MT.AS</code>; got <code>.PA</code> appended.</li>
+      <li><strong>FTSE100 sub-class:</strong> BT Group's class-A share is <code>BT.A</code> on Wikipedia but <code>BT-A.L</code> on Yahoo (hyphen, like SP500's BRK-B). Got <code>BT.A.L</code>.</li>
+    </ul>
+    <p>Fix: top-of-function <code>KNOWN_EXCHANGE_SUFFIXES</code> check — any ticker already ending in <code>.PA</code> / <code>.DE</code> / <code>.AS</code> / <code>.BR</code> / <code>.MI</code> / <code>.MC</code> / <code>.HE</code> / <code>.IR</code> / <code>.L</code> / <code>.T</code> passes through. Plus FTSE100 now does dot→hyphen for interior dots like SP500 does. <span class="commit">498d3ce</span></p>
+    <p>5 new regression tests covering all three patterns.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p10">
+  <h2>10 — Stray tail.exe blocking PC sleep</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>My PC didn't go to sleep. Why?</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Diagnosed: 3 <code>tail.exe</code> processes left over from the Monitor tool's <code>tail -f log | grep ...</code> commands. <code>TaskStop</code> + timeout ended the harness's tracking but didn't kill the actual subprocesses. Windows treats active file IO as user activity → no sleep. Killed them; saved the rule to memory: always check + clean up <code>tail.exe</code> after using the Monitor tool.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p11">
+  <h2>11 — Feature batch: Quantity, buttons, hyperlinks, ETFs</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <ul>
+      <li>The buttons should be moved to the right. They hide column B.</li>
+      <li>Remove the Quantity column from the Main sheet.</li>
+      <li>Add various ETFs to the list.</li>
+      <li>Add hyperlinks to Yahoo on each Symbol cell in Market.</li>
+      <li>Error reporting: provide suggestions.</li>
+      <li>Cosmetic changes — respect them.</li>
+      <li>Replace TestMode flag by a checkbox.</li>
+      <li>Status field says "Stock Picker" which is meaningless.</li>
+    </ul>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Six commits over the batch:</p>
+    <ul>
+      <li><span class="commit">57506ce</span> Layout: Quantity removed, buttons at left=720, cosmetic preservation tightened.</li>
+      <li><span class="commit">fa82443</span> Test-mode checkbox (LinkedCell=Main!B5) added by <code>setup-buttons</code>.</li>
+      <li><span class="commit">fd21ab6</span> Yahoo hyperlinks on every Symbol cell (openpyxl + xlwings paths).</li>
+      <li><span class="commit">d8e0d91</span> 38 curated ETFs (7 index + 11 sector SPDR + 20 country iShares).</li>
+      <li><span class="commit">3589f5d</span> Error reporting: log file + Errors sheet + Status cell (replaces truncated VBA MsgBox).</li>
+      <li><span class="commit">c77ed5d</span> CLAUDE.md rewritten for the batch.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p12">
+  <h2>12 — Error reporting overhaul (log + Errors sheet + Status)</h2>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Old behavior: button function raised → xlwings/VBA showed Excel's truncated MessageBox; "Press Ctrl+C to copy" didn't work.</p>
+    <p>New behavior: <code>button_*</code> functions catch all exceptions and surface them in three places:</p>
+    <ol>
+      <li><code>stocks_errors.log</code> next to the workbook — full traceback, append-only.</li>
+      <li>An <code>Errors</code> sheet inside the workbook (created on first failure) — one row per failure.</li>
+      <li>The <code>Main!Status</code> cell — concise summary + hint.</li>
+    </ol>
+    <p>No re-raise → no truncated popup. Each of the three writes is independently try/except-guarded so the handler itself can never crash.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p13">
+  <h2>13 — Cosmetic preservation rule</h2>
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>I made cosmetic changes to the Excel workbook (new filename, new Help sheet, sort &amp; filter of the market table etc). Make sure you won't destroy them.</p>
+  </div>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Tightened the rule again: <code>_layout_main_sheet</code>'s <code>_set</code> helper is a complete no-op when called with <code>overwrite=False</code>. Renames survive. Clearances survive. Bespoke styling survives. Regression test asserts that A3=None and A5=None after the user clears them, and that re-running init does not restore them.</p>
+    <p>Same rule now in CLAUDE.md "What NOT to change without asking".</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p14">
+  <h2>14 — Test suite incomplete → xlwings test layer</h2>
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Those two errors show your test suite is incomplete. Fix that</p>
+  </div>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Identified the gap: offline tests covered openpyxl + parsing/logic; integration tests covered network fetchers. Neither exercised xlwings/COM workbook manipulation — exactly where the two recent bugs lived (AutoFilter re-apply on non-active sheet, <code>sheets.add(after=very_hidden)</code>).</p>
+    <p>New <code>test_xlwings.py</code> with 9 tests behind the existing <code>@integration</code> marker. Module-scoped headless Excel app + function-scoped workbooks with a planted very-hidden trailing sheet reproducing the user's setup-buttons output state.</p>
+    <p>Extracted the inline AutoFilter logic from <code>button_rebuild_inventory</code> into a testable <code>_xw_reapply_market_autofilter</code> helper. <span class="commit">56c74fe</span></p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p15">
+  <h2>15 — xlwings tests killing user's Excel — skip guard</h2>
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p><em>Screenshot:</em> "Those new tests kill other Excel sessions". Fix this</p>
+  </div>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Root cause: on some Excel/COM combos, <code>xw.App()</code> can bind to an existing user instance, and <code>app.quit()</code> on teardown then closes the user's workbooks (destroying unsaved work).</p>
+    <p>Fix: at the top of the test fixture, check <code>xw.apps</code> — if non-empty, <code>pytest.skip</code> the whole module with a clear message: "Excel is already running. Close it and re-run if you want this layer covered." Verified: 9 tests skip cleanly with Excel open. <span class="commit">f2ec560</span></p>
+    <p>Saved the rule to memory: any test that creates an xlwings App MUST skip when Excel is running.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p16">
+  <h2>16 — v03: Monthly winners + losers + Owned? + AutoFilter</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <ul>
+      <li>When testing Get Quotes, the "Monthly movers" is empty. This is wrong.</li>
+      <li>Add a new "Monthly losers" sheet, same format. Include the "Owned?" column.</li>
+      <li>Make sure filtering is on: Market, Monthly movers, Monthly losers.</li>
+      <li>Rename Monthly movers into Monthly winners.</li>
+      <li>In Monthly losers, filter on "Owned?".</li>
+    </ul>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Single big commit <span class="commit">5fabbbf</span>, v02 → v03:</p>
+    <ul>
+      <li><strong>Renamed:</strong> "Monthly movers" → "Monthly winners". Migration helpers auto-rename existing sheets without touching content.</li>
+      <li><strong>New Monthly losers sheet</strong> with mirrored filter: <code>pct_1m &lt; 0 AND pct_1d &lt;= 0 AND pct_1w &lt;= 0</code> (sustained declines, not bouncing back). Sorted by 1M ascending.</li>
+      <li><strong>Owned? column</strong> added to both ranking sheets (column C).</li>
+      <li><strong>Fixed empty-in-test-mode bug:</strong> ranking is now computed from the FULL Market sheet snapshot, not just the rows refreshed this run. Test mode (1 ticker refreshed) still produces meaningful winners/losers from the rest of the existing data.</li>
+      <li><strong>AutoFilter</strong> on Market + Monthly winners + Monthly losers. Losers sheet has Owned?=Yes pre-filter applied (col index 3) — opens to losing stocks you own.</li>
+      <li><strong>SCHEMA_VERSION → v03,</strong> VERSION_HISTORY entry added (Help sheet picks it up on next run).</li>
+    </ul>
+    <p>Test pyramid final state: 132 offline + 18 integration + 11 Excel-COM = 161 tests.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p17">
+  <h2>17 — Workbook rename, archives, handoff</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>What is the most recent xlsm now? I am lost</p>
+  </div>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Surveyed: <code>stocks_picker_v01.xlsm</code> (761 KB, real data) and <code>stocks_picker_v02.xlsm</code> (21 KB, my test artifact). Proposed three options; the user chose "delete my v02, rename v01 → v02". Done.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>What are the unnecessary files in this folder? Move them to an archives folder</p>
+  </div>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Moved 6 files to <code>archives/</code>: <code>stocks-report.zip</code>, two old <code>bel20_*.log</code> files, the May 12 <code>rebuild_full.log</code> and <code>get_quotes_full.log</code>, the recent <code>stocks_errors.log</code>. All already gitignored via existing patterns.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Save all this session in a nice HTML file named claude_session_01.html. Summarize everything in HANDOFF.md at the repo root.</p>
+  </div>
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Wrote both files. <code>HANDOFF.md</code> covers objectives, decisions, what was built, current state, outstanding work. This HTML is a navigable digest of the major exchanges.</p>
+  </div>
+</section>
+
+<footer class="page">
+  <p>
+    Generated 2026-05-13. Final commit at handoff: <span class="commit">5fabbbf</span>.
+    See <a href="HANDOFF.md">HANDOFF.md</a> for a structured outstanding-work list.
+    Read CLAUDE.md + MEMORY.md to pick this project back up.
+  </p>
+</footer>
+
+</body>
+</html>
