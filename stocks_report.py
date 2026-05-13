@@ -1183,8 +1183,18 @@ def init_workbook(path: Path) -> Path:
     only re-asserts headers, section labels, and column widths. It will never
     blow away the portfolio area, the Market data rows, or any VBA the user
     has imported into the workbook.
+
+    Note: openpyxl can't author a macro-enabled .xlsm from scratch — Excel
+    rejects the content-type mismatch. If the caller asked for a .xlsm path
+    that doesn't yet exist, we redirect to the .xlsx counterpart; the
+    subsequent ``setup-buttons`` run does the .xlsm conversion via Excel COM.
     """
     path = Path(path)
+    if not path.exists() and path.suffix.lower() == ".xlsm":
+        redirected = path.with_suffix(".xlsx")
+        log.info(f"openpyxl can't author .xlsm from scratch — writing "
+                 f"{redirected.name} instead (setup-buttons will convert).")
+        path = redirected
     if path.exists():
         log.info(f"Refreshing workbook layout in {path} (data + cosmetics preserved)")
         wb = _load_xl(path)
@@ -2191,8 +2201,16 @@ def _cmd_setup_buttons(args) -> int:
 
     src = Path(args.workbook).resolve()
     if not src.exists():
-        log.error(f"Workbook {src} does not exist. Run init-workbook first.")
-        return 1
+        # init-workbook redirects .xlsm → .xlsx since openpyxl can't author
+        # a valid .xlsm. Look for that fallback before erroring out.
+        fallback = src.with_suffix(".xlsx")
+        if fallback.exists():
+            log.info(f"{src.name} doesn't exist; using {fallback.name} as the "
+                     "init-workbook output to convert.")
+            src = fallback
+        else:
+            log.error(f"Workbook {src} does not exist. Run init-workbook first.")
+            return 1
     target = src.with_suffix(".xlsm")
 
     log.info(f"Opening {src} in Excel (headless)")
@@ -2200,6 +2218,42 @@ def _cmd_setup_buttons(args) -> int:
     try:
         wb = app.books.open(str(src))
         main = wb.sheets["Main"]
+
+        # 0. Import the VBA module so the buttons' OnAction macros (RebuildInventory,
+        #    GetQuotes) actually resolve when the user clicks them. Requires Excel's
+        #    "Trust access to the VBA project object model" setting to be enabled —
+        #    falls back to a logged warning + the old manual-import instructions
+        #    if it isn't, so the script still does everything else useful.
+        bas_path = (Path(__file__).resolve().parent / "vba" / "stocks_picker.bas")
+        vba_imported = False
+        if bas_path.exists():
+            try:
+                vbproject = wb.api.VBProject
+                # Remove any existing copy first so import doesn't duplicate the
+                # module under a different name (Excel renames to stocks_picker1
+                # / 2 / etc. on conflict).
+                try:
+                    existing = vbproject.VBComponents("stocks_picker")
+                    vbproject.VBComponents.Remove(existing)
+                except Exception:
+                    pass  # didn't exist — fine
+                vbproject.VBComponents.Import(str(bas_path))
+                vba_imported = True
+                log.info(f"Imported VBA module from {bas_path.name}")
+            except Exception as e:
+                msg = str(e)
+                if "trust" in msg.lower() or "Programmatic access" in msg:
+                    log.warning(
+                        "Could not import VBA programmatically — Excel's "
+                        "\"Trust access to the VBA project object model\" "
+                        "setting is OFF. The .bas file at "
+                        f"{bas_path} must be imported manually via Alt+F11."
+                    )
+                else:
+                    log.warning(f"VBA import failed ({type(e).__name__}: {msg}); "
+                                "will need manual Alt+F11 import.")
+        else:
+            log.warning(f"VBA source not found at {bas_path}; skipping import.")
 
         # 1. Add xlwings.conf sheet (used by xlwings to find Python interpreter).
         if "xlwings.conf" not in [s.name for s in wb.sheets]:
@@ -2272,12 +2326,20 @@ def _cmd_setup_buttons(args) -> int:
 
         log.info(f"setup-buttons: workbook saved as {target}")
         log.info("")
-        log.info("Final manual step (one-time):")
-        log.info(f"  1. Open {target.name} in Excel.")
-        log.info("  2. Press Alt+F11 -> File -> Import File -> select vba/stocks_picker.bas.")
-        log.info("  3. Save (the buttons will now respond to clicks).")
+        if vba_imported:
+            log.info("VBA module imported — the buttons should respond to clicks as")
+            log.info(f"soon as you open {target.name} and click 'Enable Content'.")
+        else:
+            log.info("Manual VBA-import step still needed (couldn't do it auto-)")
+            log.info(f"  1. Open {target.name} in Excel.")
+            log.info("  2. Press Alt+F11 -> File -> Import File -> select vba/stocks_picker.bas.")
+            log.info("  3. Save.")
+            log.info("Enable 'Trust access to the VBA project object model' in Excel's")
+            log.info("Trust Center to skip this step on the next setup-buttons run.")
         log.info("")
-        log.info(r"Also run once: `.\.venv\Scripts\xlwings.exe addin install`")
+        log.info("First-time-per-machine step (skip if already done):")
+        log.info(r"  .\.venv\Scripts\xlwings.exe addin install")
+        log.info(r"  Workbook VBA editor: Tools -> References -> tick 'xlwings'")
         return 0
     finally:
         app.quit()
