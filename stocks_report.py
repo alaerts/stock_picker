@@ -677,7 +677,7 @@ def fetch_all_info(tickers: list[str], delay: float = 0.0,
                    progress: Optional[Callable[[int, int, str], None]] = None,
                    should_stop: Optional[Callable[[], bool]] = None,
                    stop_poll_every: int = 25,
-                   max_workers: int = 12) -> dict[str, dict]:
+                   max_workers: int = 8) -> dict[str, dict]:
     """Fetch yfinance .info for each ticker, in parallel.
 
     Speedup A: uses ``ThreadPoolExecutor`` with ``max_workers`` concurrent
@@ -819,7 +819,7 @@ def fetch_all_info_with_cache(
     ttl_seconds: Optional[float] = None,
     progress: Optional[Callable[[int, int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
-    max_workers: int = 12,
+    max_workers: int = 8,
 ) -> tuple[dict[str, dict], int]:
     """Speedup F wrapper around ``fetch_all_info`` — returns ``(info_map, cached_count)``.
 
@@ -1626,6 +1626,7 @@ def rebuild_inventory(
     _say(f"rebuild_inventory: starting ({', '.join(indexes)})")
 
     portfolio = read_portfolio_symbols(wb["Main"])
+    portfolio_entries = read_portfolio_entries(wb["Main"])
     _say(f"  Portfolio entries: {len(portfolio)}")
 
     _say("Fetching index constituents")
@@ -1637,12 +1638,17 @@ def rebuild_inventory(
         constituents = constituents.head(TEST_MODE_TICKER_LIMIT)
     _say(f"  Total unique tickers: {len(constituents)}")
 
-    # Validate that every portfolio entry exists in the universe — catches
-    # typos in Main!Portfolio (e.g., "KBC" without the .BR suffix, or a
-    # symbol that's been delisted). Skip in test mode since constituents
-    # is intentionally trimmed.
+    # Auto-adopt unresolved portfolio entries (look up on Yahoo, append as
+    # synthetic "Portfolio"-indexed constituents). Unresolvable symbols get
+    # an error string in Main column C of their own row. Skipped in test
+    # mode since constituents is intentionally trimmed.
     if not test_mode:
-        _check_portfolio_symbols_resolve(portfolio, set(constituents["Symbol"]))
+        main_ws_local = wb["Main"]
+        def _write_pf_err(row_idx: int, msg: Optional[str]) -> None:
+            main_ws_local.cell(row=row_idx, column=PORTFOLIO_ERROR_COL, value=msg)
+        constituents = resolve_or_adopt_portfolio(
+            portfolio_entries, constituents, _write_pf_err,
+        )
 
     if test_mode:
         wl_membership: dict[str, list[str]] = {}
@@ -1945,6 +1951,7 @@ def button_rebuild_inventory() -> None:
         status(f"rebuild: starting ({'TEST: BEL20 head' if test_mode else 'full'})")
 
         portfolio = _xw_read_portfolio(main)
+        portfolio_entries = _xw_read_portfolio_entries(main)
         status(f"Portfolio entries: {len(portfolio)}")
 
         status("Fetching index constituents…")
@@ -1956,10 +1963,14 @@ def button_rebuild_inventory() -> None:
             constituents = constituents.head(TEST_MODE_TICKER_LIMIT)
         status(f"Total unique tickers: {len(constituents)}")
 
-        # Validate portfolio symbols resolve in the universe. Skip in test
-        # mode since constituents is intentionally trimmed.
+        # Auto-adopt unresolved portfolio entries. Errors land in Main col C
+        # of the offending row. Skipped in test mode (constituents trimmed).
         if not test_mode:
-            _check_portfolio_symbols_resolve(portfolio, set(constituents["Symbol"]))
+            def _write_pf_err_xw(row_idx: int, msg: Optional[str]) -> None:
+                main.range((row_idx, PORTFOLIO_ERROR_COL)).value = msg
+            constituents = resolve_or_adopt_portfolio(
+                portfolio_entries, constituents, _write_pf_err_xw,
+            )
 
         if test_mode:
             wl_membership: dict[str, list[str]] = {}
@@ -2396,32 +2407,126 @@ MONTHLY_RANKING_TOP_N = 50
 OWNED_COL_INDEX_1BASED = RANKING_HEADERS.index("Owned?") + 1  # 3
 
 
-def _check_portfolio_symbols_resolve(portfolio: set[str],
-                                       market_symbols: set[str]) -> None:
-    """Raise RuntimeError listing any portfolio symbol that doesn't appear
-    in the rebuilt Market universe (with or without exchange suffix).
+PORTFOLIO_ADOPTED_INDEX_LABEL = "Portfolio"
+PORTFOLIO_ERROR_COL = 3  # Main column C: portfolio error messages
 
-    Catches the common typo / delisting case: user has "KBC" in Main but
-    the workbook stores "KBC.BR" — would silently never get Owned?=Yes.
+
+def _portfolio_symbol_resolves(sym: str, market_upper: set[str],
+                               market_roots: set[str]) -> bool:
+    """True if a portfolio entry matches an existing constituent (with or
+    without exchange suffix)."""
+    s = sym.upper()
+    if s in market_upper or s in market_roots:
+        return True
+    return any(m.startswith(s + ".") for m in market_upper)
+
+
+def _yahoo_lookup_for_adoption(sym: str) -> Optional[dict]:
+    """Best-effort Yahoo lookup. Returns a dict with at least Name if Yahoo
+    knows the ticker, else None.
+
+    A ticker is considered resolved if .info exposes a price-like field
+    (regularMarketPrice, currentPrice, previousClose) or a symbol field —
+    enough to confirm the ticker is live.
     """
-    market_upper = {s.upper() for s in market_symbols}
-    market_roots = {re.sub(r"\.[A-Z]{1,3}$", "", s.upper()) for s in market_symbols}
-    missing: list[str] = []
-    for sym in portfolio:
-        s_upper = sym.upper()
-        if s_upper in market_upper or s_upper in market_roots:
+    try:
+        info = yf.Ticker(sym).info or {}
+    except Exception as e:
+        log.debug(f"yahoo lookup '{sym}' raised: {e}")
+        return None
+    has_price = any(info.get(k) is not None for k in
+                    ("regularMarketPrice", "currentPrice", "previousClose"))
+    has_symbol = bool(info.get("symbol")) or bool(info.get("shortName")) or bool(info.get("longName"))
+    if has_price or has_symbol:
+        return {
+            "Name": info.get("longName") or info.get("shortName") or sym,
+            "currency": info.get("currency") or "",
+        }
+    return None
+
+
+def resolve_or_adopt_portfolio(
+    portfolio_entries: list[tuple[int, str]],
+    constituents: pd.DataFrame,
+    write_error: Callable[[int, Optional[str]], None],
+) -> pd.DataFrame:
+    """Auto-adopt unresolved portfolio entries into the constituents universe.
+
+    For each ``(row_idx, symbol)`` in ``portfolio_entries``:
+      * If the symbol already matches a constituent (with or without
+        exchange suffix), clear any stale error and move on.
+      * Else try ``yf.Ticker(symbol)``. If Yahoo recognises it, append a
+        synthetic constituent row with ``Indexes="Portfolio"`` so the
+        ticker flows through .info / price / Owned? like any other row,
+        and clear the error.
+      * Else call ``write_error(row_idx, msg)`` with a one-line reason —
+        the rebuild proceeds (no longer raises).
+
+    Returns the (possibly augmented) constituents DataFrame.
+    """
+    market_upper = {s.upper() for s in constituents["Symbol"]}
+    market_roots = {re.sub(r"\.[A-Z]{1,3}$", "", s.upper()) for s in constituents["Symbol"]}
+    extra_rows: list[dict] = []
+    adopted: list[str] = []
+    failed: list[str] = []
+    for row_idx, sym in portfolio_entries:
+        if _portfolio_symbol_resolves(sym, market_upper, market_roots):
+            write_error(row_idx, None)
             continue
-        # Also try treating the entry as a root that should match a
-        # suffixed Market symbol (rare).
-        if any(m.startswith(s_upper + ".") for m in market_upper):
+        info = _yahoo_lookup_for_adoption(sym)
+        if info is not None:
+            extra_rows.append({
+                "Symbol": sym,
+                "Name": info["Name"],
+                "Indexes": PORTFOLIO_ADOPTED_INDEX_LABEL,
+            })
+            # Refresh the lookup sets so two portfolio entries pointing at
+            # the same ticker don't both get appended.
+            market_upper.add(sym.upper())
+            market_roots.add(re.sub(r"\.[A-Z]{1,3}$", "", sym.upper()))
+            write_error(row_idx, None)
+            adopted.append(sym)
+        else:
+            write_error(row_idx, f"Symbol not found on Yahoo Finance ({sym})")
+            failed.append(sym)
+    if adopted:
+        log.info(f"  Adopted {len(adopted)} portfolio symbol(s) into universe: {', '.join(adopted)}")
+    if failed:
+        log.warning(f"  {len(failed)} portfolio symbol(s) unresolvable on Yahoo: "
+                    f"{', '.join(failed)} — error written to Main col C")
+    if extra_rows:
+        return pd.concat([constituents, pd.DataFrame(extra_rows)], ignore_index=True)
+    return constituents
+
+
+def read_portfolio_entries(main_ws: Worksheet) -> list[tuple[int, str]]:
+    """Row-aware portfolio reader: ``[(row_idx, SYMBOL), ...]`` for openpyxl.
+
+    Used by the auto-adopt path to write errors back to the specific row
+    where the unresolvable symbol lives.
+    """
+    out: list[tuple[int, str]] = []
+    for r in range(PORTFOLIO_FIRST_ROW, PORTFOLIO_LAST_ROW + 1):
+        v = main_ws.cell(row=r, column=1).value
+        if v is None:
             continue
-        missing.append(sym)
-    if missing:
-        raise RuntimeError(
-            f"Portfolio symbol(s) not found in the rebuilt Market universe: "
-            f"{', '.join(sorted(missing))}. "
-            "Check Main!Portfolio for typos or delisted tickers."
-        )
+        sym = str(v).strip().upper()
+        if sym:
+            out.append((r, sym))
+    return out
+
+
+def _xw_read_portfolio_entries(main_sheet) -> list[tuple[int, str]]:
+    """Row-aware portfolio reader for xlwings (live workbook)."""
+    out: list[tuple[int, str]] = []
+    for r in range(PORTFOLIO_FIRST_ROW, PORTFOLIO_LAST_ROW + 1):
+        v = main_sheet.range((r, 1)).value
+        if v is None:
+            continue
+        sym = str(v).strip().upper()
+        if sym:
+            out.append((r, sym))
+    return out
 
 
 def _is_owned(owned_value) -> bool:

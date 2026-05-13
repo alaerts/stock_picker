@@ -679,25 +679,100 @@ def test_fetch_all_info_should_stop_lets_loop_finish_when_false(monkeypatch):
     assert len(out) == len(tickers)
 
 
-def test_check_portfolio_symbols_resolve_raises_on_missing():
+def test_portfolio_symbol_resolves_exact_and_suffix():
+    """The match logic accepts exact, suffix-stripped, and root-with-suffix forms."""
     import stocks_report as sr
-    market = {"AAPL", "KBC.BR", "SAP.DE"}
-    # Hit: exact match
-    sr._check_portfolio_symbols_resolve({"AAPL"}, market)
-    # Hit: suffix-stripped root resolves to suffixed symbol
-    sr._check_portfolio_symbols_resolve({"KBC"}, market)
-    # Miss: typo
-    with pytest.raises(RuntimeError, match="Portfolio symbol"):
-        sr._check_portfolio_symbols_resolve({"TYPO"}, market)
-    # Miss: delisted
-    with pytest.raises(RuntimeError, match="DEAD"):
-        sr._check_portfolio_symbols_resolve({"AAPL", "DEAD.X"}, market)
+    market_upper = {"AAPL", "KBC.BR", "SAP.DE"}
+    market_roots = {"AAPL", "KBC", "SAP"}
+    assert sr._portfolio_symbol_resolves("AAPL", market_upper, market_roots)
+    assert sr._portfolio_symbol_resolves("KBC", market_upper, market_roots)
+    assert sr._portfolio_symbol_resolves("KBC.BR", market_upper, market_roots)
+    assert not sr._portfolio_symbol_resolves("TYPO", market_upper, market_roots)
 
 
-def test_check_portfolio_symbols_resolve_empty_portfolio_ok():
+def test_resolve_or_adopt_clears_error_when_symbol_already_in_market(monkeypatch):
+    """If a portfolio entry is already a constituent, write_error(row, None)
+    clears any stale error from a previous run."""
     import stocks_report as sr
-    # Empty portfolio — must not raise even on empty market.
-    sr._check_portfolio_symbols_resolve(set(), set())
+    monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption",
+                        lambda s: pytest.fail("must not query Yahoo for resolved symbol"))
+    constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
+    written: list[tuple[int, object]] = []
+    out = sr.resolve_or_adopt_portfolio(
+        [(16, "AAPL")], constituents, lambda r, m: written.append((r, m)),
+    )
+    assert len(out) == 1  # no synthetic row added
+    assert written == [(16, None)]
+
+
+def test_resolve_or_adopt_adopts_when_yahoo_knows_ticker(monkeypatch):
+    """An unresolved symbol that Yahoo knows becomes a synthetic row with
+    Indexes='Portfolio'; error is cleared."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption",
+                        lambda s: {"Name": f"Long {s}", "currency": "EUR"})
+    constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
+    written: list[tuple[int, object]] = []
+    out = sr.resolve_or_adopt_portfolio(
+        [(17, "CSKRL.XC")], constituents, lambda r, m: written.append((r, m)),
+    )
+    assert "CSKRL.XC" in set(out["Symbol"])
+    adopted = out[out["Symbol"] == "CSKRL.XC"].iloc[0]
+    assert adopted["Indexes"] == "Portfolio"
+    assert adopted["Name"] == "Long CSKRL.XC"
+    assert written == [(17, None)]
+
+
+def test_resolve_or_adopt_writes_error_when_yahoo_fails(monkeypatch):
+    """An unresolved symbol that Yahoo can't find: error written to row,
+    constituents unchanged, no raise."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption", lambda s: None)
+    constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
+    written: list[tuple[int, object]] = []
+    out = sr.resolve_or_adopt_portfolio(
+        [(18, "TYPO")], constituents, lambda r, m: written.append((r, m)),
+    )
+    assert "TYPO" not in set(out["Symbol"])
+    assert len(written) == 1 and written[0][0] == 18
+    assert "Yahoo" in written[0][1]
+    assert "TYPO" in written[0][1]
+
+
+def test_resolve_or_adopt_empty_portfolio_ok():
+    """Empty portfolio is a no-op on an empty market."""
+    import stocks_report as sr
+    constituents = pd.DataFrame(columns=["Symbol", "Name", "Indexes"])
+    out = sr.resolve_or_adopt_portfolio([], constituents, lambda r, m: None)
+    assert len(out) == 0
+
+
+def test_resolve_or_adopt_does_not_double_adopt_same_ticker(monkeypatch):
+    """Two portfolio rows pointing at the same unresolved ticker yield one
+    synthetic constituent, not two."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption",
+                        lambda s: {"Name": s, "currency": ""})
+    constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
+    out = sr.resolve_or_adopt_portfolio(
+        [(16, "FOO.X"), (17, "FOO.X")], constituents, lambda r, m: None,
+    )
+    foo_rows = out[out["Symbol"] == "FOO.X"]
+    assert len(foo_rows) == 1
+
+
+def test_read_portfolio_entries_preserves_row_indices():
+    """read_portfolio_entries returns (row_idx, SYMBOL) tuples for error reporting."""
+    from openpyxl import Workbook
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Main"
+    ws.cell(row=16, column=1, value="AAPL")
+    ws.cell(row=17, column=1, value=None)  # gap
+    ws.cell(row=18, column=1, value="kbc.br")  # mixed case → uppercased
+    out = sr.read_portfolio_entries(ws)
+    assert out == [(16, "AAPL"), (18, "KBC.BR")]
 
 
 def test_read_stop_requested_interprets_cell(tmp_path):
