@@ -672,16 +672,33 @@ def fetch_ticker_info(ticker: str) -> dict:
     }
 
 def fetch_all_info(tickers: list[str], delay: float = 0.25,
-                   progress: Optional[Callable[[int, int, str], None]] = None) -> dict[str, dict]:
-    """Fetch yfinance .info for each ticker. Optional ``progress`` callback is
-    invoked as ``progress(done, total, current_symbol)`` before each fetch — used
-    by rebuild_inventory to push live ticker count into the workbook's Status cell.
+                   progress: Optional[Callable[[int, int, str], None]] = None,
+                   should_stop: Optional[Callable[[], bool]] = None,
+                   stop_poll_every: int = 25) -> dict[str, dict]:
+    """Fetch yfinance .info for each ticker.
+
+    Optional callbacks:
+      - ``progress(done, total, current_symbol)`` invoked before each fetch —
+        used by rebuild_inventory to push live ticker count into the workbook's
+        Status cell.
+      - ``should_stop()`` polled every ``stop_poll_every`` tickers — when it
+        returns True the loop breaks early, returning whatever has been
+        gathered so far. The caller is responsible for any partial-state
+        handling. This is the cell-based STOP path: the user toggles the
+        STOP checkbox on Main and Python sees it on the next poll.
     """
     log.info(f"Fetching .info for {len(tickers)} tickers (delay={delay}s)")
     out: dict[str, dict] = {}
     for i, t in enumerate(tickers, 1):
         if i % 50 == 0 or i == 1:
             log.info(f"  info {i}/{len(tickers)}")
+        if should_stop is not None and (i == 1 or i % stop_poll_every == 0):
+            try:
+                if should_stop():
+                    log.info(f"  STOP requested at {i}/{len(tickers)} — breaking out of .info loop")
+                    break
+            except Exception as e:
+                log.debug(f"should_stop callback raised: {e}")
         if progress is not None:
             try:
                 progress(i, len(tickers), t)
@@ -689,6 +706,7 @@ def fetch_all_info(tickers: list[str], delay: float = 0.25,
                 log.debug(f"progress callback failed: {e}")
         out[t] = fetch_ticker_info(t)
         time.sleep(delay)
+    # Caller can detect "stop" via len(out) < len(tickers).
     return out
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1049,8 @@ MAIN_CELLS: dict[str, str] = {
     "EurUsd":         "B10",
     "EurJpy":         "B11",
     "EurGbp":         "B12",
+    "StopRequested":  "B13",  # checkbox-linked; Python polls during .info loop
+    "JobRunning":     "B14",  # VBA-flipped wrapper guard against double-clicks
 }
 
 # Portfolio area on Main: header row + many rows for user entries.
@@ -1092,17 +1112,21 @@ def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     _set("A11", "EUR/JPY (1 EUR = X JPY):")
     _set("A12", "EUR/GBP (1 EUR = X GBP):")
 
+    _set("A13", "Stop a running job:")
     _set("A14", "Portfolio (manual — list every Symbol you own)", bold=True, size=12)
 
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=1).coordinate, "Symbol", bold=True)
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=2).coordinate, "Notes", bold=True)
 
-    # Only on fresh creation: hide the TestMode cell display and set column
-    # widths. On re-runs we don't touch either — respects user cosmetic edits.
+    # Only on fresh creation: hide the TestMode / StopRequested / JobRunning
+    # cell displays (the user shouldn't see TRUE/FALSE next to checkboxes
+    # or in tracker cells) and set column widths. On re-runs we don't touch
+    # any of these — respects user cosmetic edits.
     if overwrite:
-        # ";;;" is Excel's "hide all" number format, so the TRUE/FALSE the
-        # checkbox writes into B5 isn't displayed.
-        ws[MAIN_CELLS["TestMode"]].number_format = ";;;"
+        for hidden_addr in (MAIN_CELLS["TestMode"],
+                            MAIN_CELLS["StopRequested"],
+                            MAIN_CELLS["JobRunning"]):
+            ws[hidden_addr].number_format = ";;;"
         ws.column_dimensions["A"].width = 38
         ws.column_dimensions["B"].width = 60
 
@@ -1150,6 +1174,18 @@ def _market_col(name: str) -> int:
 
 
 _TEST_MODE_TRUTHY = {"TRUE", "T", "YES", "Y", "1"}
+
+
+def read_stop_requested(main_ws: Worksheet) -> bool:
+    """Interpret the Main!StopRequested cell (openpyxl). The STOP checkbox
+    set up by setup-buttons flips this cell to TRUE; Python's .info loop
+    polls it and breaks out cleanly when set."""
+    raw = main_ws[MAIN_CELLS["StopRequested"]].value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().upper() in _TEST_MODE_TRUTHY
 
 
 def read_test_mode(main_ws: Worksheet) -> bool:
@@ -1425,6 +1461,13 @@ def rebuild_inventory(
         constituents = constituents.head(TEST_MODE_TICKER_LIMIT)
     _say(f"  Total unique tickers: {len(constituents)}")
 
+    # Validate that every portfolio entry exists in the universe — catches
+    # typos in Main!Portfolio (e.g., "KBC" without the .BR suffix, or a
+    # symbol that's been delisted). Skip in test mode since constituents
+    # is intentionally trimmed.
+    if not test_mode:
+        _check_portfolio_symbols_resolve(portfolio, set(constituents["Symbol"]))
+
     if test_mode:
         wl_membership: dict[str, list[str]] = {}
     else:
@@ -1438,8 +1481,20 @@ def rebuild_inventory(
         if status is not None and (done == 1 or done == total or done % 25 == 0):
             status(f"info {done}/{total} — {sym}")
 
-    info_map = fetch_all_info(list(constituents["Symbol"]), delay=info_delay,
-                              progress=info_progress)
+    # Reset stale STOP flag at the start of each CLI run; cell-based STOP
+    # works via the workbook checkbox same as the button path.
+    main_for_stop = wb["Main"]
+    if main_for_stop[MAIN_CELLS["StopRequested"]].value is not None:
+        main_for_stop[MAIN_CELLS["StopRequested"]] = "FALSE"
+
+    info_map = fetch_all_info(
+        list(constituents["Symbol"]), delay=info_delay,
+        progress=info_progress,
+        should_stop=lambda: read_stop_requested(wb["Main"]),
+    )
+    if len(info_map) < len(constituents):
+        _say(f"STOPPED at {len(info_map)}/{len(constituents)} tickers — Market not modified.")
+        return 0
 
     market_ws = wb["Market"]
     cols = {name: i + 1 for i, name in enumerate(MARKET_COLUMNS)}
@@ -1665,6 +1720,29 @@ def _xw_read_test_mode(main_sheet) -> bool:
     return str(raw).strip().upper() in _TEST_MODE_TRUTHY
 
 
+def _xw_read_stop_requested(main_sheet) -> bool:
+    """Read Main!StopRequested via xlwings. Polled during the .info loop
+    every N tickers — when TRUE the loop breaks out and the job exits
+    cleanly (no Market write for rebuild, partial-write for get_quotes)."""
+    try:
+        raw = main_sheet.range(MAIN_CELLS["StopRequested"]).value
+    except Exception:
+        return False
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().upper() in _TEST_MODE_TRUTHY
+
+
+def _xw_clear_stop_requested(main_sheet) -> None:
+    """Reset Main!StopRequested to FALSE at the start of each job."""
+    try:
+        main_sheet.range(MAIN_CELLS["StopRequested"]).value = "FALSE"
+    except Exception:
+        pass
+
+
 def button_rebuild_inventory() -> None:
     """Entry point for the Excel "Rebuild Inventory" button."""
     import traceback as _tb
@@ -1675,6 +1753,10 @@ def button_rebuild_inventory() -> None:
     status = _xw_status(main)
 
     try:
+        # Reset Stop flag at the start of each run so a stale TRUE from a
+        # previous run doesn't immediately halt this one.
+        _xw_clear_stop_requested(main)
+
         test_mode = _xw_read_test_mode(main)
         indexes = ["BEL20"] if test_mode else list(INDEX_WIKI.keys())
         status(f"rebuild: starting ({'TEST: BEL20 head' if test_mode else 'full'})")
@@ -1691,6 +1773,11 @@ def button_rebuild_inventory() -> None:
             constituents = constituents.head(TEST_MODE_TICKER_LIMIT)
         status(f"Total unique tickers: {len(constituents)}")
 
+        # Validate portfolio symbols resolve in the universe. Skip in test
+        # mode since constituents is intentionally trimmed.
+        if not test_mode:
+            _check_portfolio_symbols_resolve(portfolio, set(constituents["Symbol"]))
+
         if test_mode:
             wl_membership: dict[str, list[str]] = {}
         else:
@@ -1703,8 +1790,16 @@ def button_rebuild_inventory() -> None:
             if done == 1 or done == total or done % 10 == 0:
                 status(f"info {done}/{total} — {sym}")
 
-        info_map = fetch_all_info(list(constituents["Symbol"]),
-                                  delay=0.25, progress=info_progress)
+        info_map = fetch_all_info(
+            list(constituents["Symbol"]),
+            delay=0.25, progress=info_progress,
+            should_stop=lambda: _xw_read_stop_requested(main),
+        )
+        # If the user clicked STOP mid-.info, bail before writing Market.
+        # Partial structural data isn't useful — leave Market as it was.
+        if len(info_map) < len(constituents):
+            status(f"STOPPED at {len(info_map)}/{len(constituents)} tickers — Market not modified.")
+            return
 
         status("Building rows…")
         rows = []
@@ -1835,6 +1930,8 @@ def button_get_quotes() -> None:
     status = _xw_status(main)
 
     try:
+        _xw_clear_stop_requested(main)  # reset stale STOP flag
+
         test_mode = _xw_read_test_mode(main)
         status(f"quotes: starting (test_mode={test_mode})")
 
@@ -1904,7 +2001,14 @@ def button_get_quotes() -> None:
             if done == 1 or done == total or done % 10 == 0:
                 status(f"quotes {done}/{total} — {sym}")
 
-        info_map = fetch_all_info([t[1] for t in targets], delay=0.25, progress=info_progress)
+        info_map = fetch_all_info(
+            [t[1] for t in targets], delay=0.25, progress=info_progress,
+            should_stop=lambda: _xw_read_stop_requested(main),
+        )
+        info_stopped = len(info_map) < len(targets)
+        if info_stopped:
+            status(f"STOP detected — only {len(info_map)} of {len(targets)} .info fetches done; "
+                   "continuing to write rows we have")
 
         status(f"Writing quote columns for {len(targets)} rows…")
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1913,6 +2017,10 @@ def button_get_quotes() -> None:
         ok = 0
         fail = 0
         for (row_idx, sym, ccy, _indexes_csv) in targets:
+            # Stop check between rows (in case the per-row loop is itself slow)
+            if _xw_read_stop_requested(main):
+                status(f"STOP detected — refreshed {ok} of {len(targets)} rows")
+                break
             try:
                 series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
                 eur_by_label = {}
@@ -2074,6 +2182,34 @@ RANKING_HEADERS = ["Symbol", "Name", "Owned?", "Indexes", "Sector",
                    "Today (EUR)", "1D %", "1W %", "1M %"]
 MONTHLY_RANKING_TOP_N = 50
 OWNED_COL_INDEX_1BASED = RANKING_HEADERS.index("Owned?") + 1  # 3
+
+
+def _check_portfolio_symbols_resolve(portfolio: set[str],
+                                       market_symbols: set[str]) -> None:
+    """Raise RuntimeError listing any portfolio symbol that doesn't appear
+    in the rebuilt Market universe (with or without exchange suffix).
+
+    Catches the common typo / delisting case: user has "KBC" in Main but
+    the workbook stores "KBC.BR" — would silently never get Owned?=Yes.
+    """
+    market_upper = {s.upper() for s in market_symbols}
+    market_roots = {re.sub(r"\.[A-Z]{1,3}$", "", s.upper()) for s in market_symbols}
+    missing: list[str] = []
+    for sym in portfolio:
+        s_upper = sym.upper()
+        if s_upper in market_upper or s_upper in market_roots:
+            continue
+        # Also try treating the entry as a root that should match a
+        # suffixed Market symbol (rare).
+        if any(m.startswith(s_upper + ".") for m in market_upper):
+            continue
+        missing.append(sym)
+    if missing:
+        raise RuntimeError(
+            f"Portfolio symbol(s) not found in the rebuilt Market universe: "
+            f"{', '.join(sorted(missing))}. "
+            "Check Main!Portfolio for typos or delisted tickers."
+        )
 
 
 def _is_owned(owned_value) -> bool:
@@ -2459,7 +2595,14 @@ def get_quotes(
         if status is not None and (done == 1 or done == total or done % 25 == 0):
             status(f"quotes {done}/{total} — {sym}")
 
-    info_map = fetch_all_info([t[1] for t in targets], delay=info_delay, progress=info_progress)
+    # Reset stale STOP flag at the start
+    if main_ws[MAIN_CELLS["StopRequested"]].value is not None:
+        main_ws[MAIN_CELLS["StopRequested"]] = "FALSE"
+
+    info_map = fetch_all_info(
+        [t[1] for t in targets], delay=info_delay, progress=info_progress,
+        should_stop=lambda: read_stop_requested(main_ws),
+    )
 
     _say("Writing quote columns")
     now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2468,6 +2611,9 @@ def get_quotes(
     successes = 0
     failures = 0
     for (row_idx, sym, ccy, indexes_csv) in targets:
+        if read_stop_requested(main_ws):
+            _say(f"STOP detected — refreshed {successes} of {len(targets)} rows")
+            break
         try:
             series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
             eur_by_label: dict[str, Optional[float]] = {}
@@ -2714,7 +2860,37 @@ def _cmd_setup_buttons(args) -> int:
         else:
             chk.ControlFormat.Value = -4146  # xlOff
 
-        # 4. SaveAs .xlsm (FileFormat 52 = xlOpenXMLWorkbookMacroEnabled).
+        # 5. Add the STOP checkbox, linked to Main!StopRequested. Excel
+        #    Form Controls write their state to LinkedCell via the internal
+        #    cell engine — instantly, even while xlwings' RunPython has the
+        #    VBA thread blocked. That's the property that makes a checkbox
+        #    the only Form Control type that works for a "stop running job"
+        #    signal (regular buttons queue their macro until VBA frees).
+        #
+        #    Add an A13 label inline since the cosmetic-preservation rule
+        #    blocks init-workbook from doing it on existing workbooks.
+        if not main.range("A13").value:
+            main.range("A13").value = "Stop a running job:"
+        # Hide the value display in B13 so the user sees only the checkbox.
+        try:
+            main.range(MAIN_CELLS["StopRequested"]).api.NumberFormat = ";;;"
+            main.range(MAIN_CELLS["JobRunning"]).api.NumberFormat = ";;;"
+        except Exception:
+            pass
+        stop_chk = sheet_api.Shapes.AddFormControl(1, 720, 110, 200, 28)
+        stop_chk.Name = "StockPicker_Stop"
+        stop_chk.TextFrame.Characters().Text = "⛔ STOP running job"
+        # Make the STOP label visually distinctive (red bold) so the user
+        # never confuses it with the Test-mode checkbox above.
+        try:
+            stop_chk.TextFrame.Characters().Font.Bold = True
+            stop_chk.TextFrame.Characters().Font.Color = 255  # red (BGR=0x0000FF)
+        except Exception:
+            pass
+        stop_chk.ControlFormat.LinkedCell = f"Main!{MAIN_CELLS['StopRequested']}"
+        stop_chk.ControlFormat.Value = -4146  # xlOff at install
+
+        # 6. SaveAs .xlsm (FileFormat 52 = xlOpenXMLWorkbookMacroEnabled).
         if target.exists() and target != src:
             target.unlink()  # Excel SaveAs refuses to overwrite without prompts in headless mode
         wb.api.SaveAs(str(target), FileFormat=52)

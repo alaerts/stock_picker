@@ -658,6 +658,66 @@ def test_migrate_monthly_movers_renames_legacy_sheet(tmp_path):
     assert wb2[MONTHLY_WINNERS_SHEET_NAME]["A1"].value == "had data"
 
 
+def test_fetch_all_info_should_stop_breaks_early(monkeypatch):
+    """should_stop callback short-circuits the loop. Returns partial dict —
+    len(out) < len(tickers) signals the caller that the run was interrupted."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {"longName": t})
+    monkeypatch.setattr(sr.time, "sleep", lambda s: None)
+    tickers = [f"T{i}" for i in range(100)]
+    # Stop after the first poll (at i==1).
+    out = sr.fetch_all_info(tickers, delay=0.0, should_stop=lambda: True, stop_poll_every=25)
+    assert len(out) < len(tickers), "fetch_all_info should break early on stop"
+
+
+def test_fetch_all_info_should_stop_lets_loop_finish_when_false(monkeypatch):
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {"longName": t})
+    monkeypatch.setattr(sr.time, "sleep", lambda s: None)
+    tickers = [f"T{i}" for i in range(50)]
+    out = sr.fetch_all_info(tickers, delay=0.0, should_stop=lambda: False)
+    assert len(out) == len(tickers)
+
+
+def test_check_portfolio_symbols_resolve_raises_on_missing():
+    import stocks_report as sr
+    market = {"AAPL", "KBC.BR", "SAP.DE"}
+    # Hit: exact match
+    sr._check_portfolio_symbols_resolve({"AAPL"}, market)
+    # Hit: suffix-stripped root resolves to suffixed symbol
+    sr._check_portfolio_symbols_resolve({"KBC"}, market)
+    # Miss: typo
+    with pytest.raises(RuntimeError, match="Portfolio symbol"):
+        sr._check_portfolio_symbols_resolve({"TYPO"}, market)
+    # Miss: delisted
+    with pytest.raises(RuntimeError, match="DEAD"):
+        sr._check_portfolio_symbols_resolve({"AAPL", "DEAD.X"}, market)
+
+
+def test_check_portfolio_symbols_resolve_empty_portfolio_ok():
+    import stocks_report as sr
+    # Empty portfolio — must not raise even on empty market.
+    sr._check_portfolio_symbols_resolve(set(), set())
+
+
+def test_read_stop_requested_interprets_cell(tmp_path):
+    """read_stop_requested mirrors read_test_mode's tolerance to common
+    truthy/falsy values."""
+    from openpyxl import Workbook
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Main"
+    ws[MAIN_CELLS["StopRequested"]] = None
+    assert sr.read_stop_requested(ws) is False
+    ws[MAIN_CELLS["StopRequested"]] = "FALSE"
+    assert sr.read_stop_requested(ws) is False
+    ws[MAIN_CELLS["StopRequested"]] = "TRUE"
+    assert sr.read_stop_requested(ws) is True
+    ws[MAIN_CELLS["StopRequested"]] = True
+    assert sr.read_stop_requested(ws) is True
+
+
 def test_get_quotes_test_mode_populates_ranking_on_unfilled_market(tmp_path, monkeypatch):
     """Regression for 2026-05-13 (round 2): Monthly winners + losers were STILL
     empty in test mode because:
