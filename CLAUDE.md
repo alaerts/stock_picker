@@ -27,16 +27,27 @@ Two CLI jobs (also wired to Excel buttons via xlwings):
   Sets per-row Last update / Last error. Surgical update — preserves
   structural columns.
 
-One workbook, four sheets (Errors created on demand):
+One workbook (filename `stocks_picker_{SCHEMA_VERSION}.xlsm`), seven
+sheets (Errors created on demand):
 
 - **Main**: manual portfolio (Symbol + Notes — no Quantity), job controls
   (two buttons + a real Excel checkbox for test mode), Status cell, and
   the metadata block (last-run timestamps, FX rates, row count). Controls
-  live at left=720 to clear column B; portfolio data starts at row 18.
+  live at left=720 to clear column B; portfolio data starts at row 16.
   TestMode is the linked cell behind the checkbox (`Main!B5`).
-- **Market**: 19-column inventory of the universe (see `MARKET_COLUMNS`).
-  Every Symbol cell carries a Yahoo Finance hyperlink (
-  `https://finance.yahoo.com/quote/{symbol}`).
+- **Help**: append-only changelog. `init-workbook` populates one row per
+  entry in `VERSION_HISTORY`. Row 1 is reserved for user-authored content
+  (e.g. their own credit line); versioned entries get appended below.
+- **Market**: 25-column inventory of the universe (see `MARKET_COLUMNS`).
+  Every Symbol cell carries a Yahoo hyperlink. The user enables AutoFilter
+  on this sheet; both rebuild paths re-apply the filter to the new data
+  extent on every rebuild.
+- **Monthly movers**: top 50 stocks ranked by 1M % descending, filtered
+  to require 1D % and 1W % also positive (no short-term weakness on a
+  monthly winner). Populated by `get_quotes` after the per-row loop.
+- **Currencies**: one row per FX pair (USD / JPY / GBP / CHF) with rates
+  at every LOOKBACKS offset (Today, 1D, 1W, 1M, 6M, 1Y, 5Y). Populated
+  by `get_quotes` after `get_fx_history()` fetches 5y series per pair.
 - **xlwings.conf** (very-hidden): interpreter path + PYTHONPATH for xlwings.
 - **Errors** (created on first failure): one row per button-triggered
   exception with timestamp, job name, exception type, message, and the
@@ -54,6 +65,20 @@ it as a question rather than changing the implementation.
   `stocks_report.py`. Flow through `aggregate_constituents()` alongside
   index constituents and get the same .info / price / hyperlink
   treatment as stocks. ETFs are included in test-mode runs too.
+- **Currencies tracked**: EUR/USD, EUR/JPY, EUR/GBP, EUR/CHF — used both
+  to convert prices into EUR and to populate the Currencies sheet. CHF
+  added 2026-05-13 at user request.
+- **Schema versioning**: the workbook filename embeds `SCHEMA_VERSION`
+  (e.g. `stocks_picker_v02.xlsm`). Bump it on major changes that add a
+  sheet, a column, or change the data contract. `VERSION_HISTORY` is
+  append-only and surfaces in the Help sheet.
+- **Cross-index ticker normalization**: a stock listed in multiple
+  indexes is one row in Market via `aggregate_constituents`. Any ticker
+  already ending in a `KNOWN_EXCHANGE_SUFFIXES` value passes through
+  `normalize_ticker` untouched — prevents double-suffixing when the same
+  stock appears in CAC40 (uses bare "MT") and ESTOXX50 (uses "MT.AS").
+  FTSE100 sub-class shares like BT.A become BT-A.L on Yahoo (hyphen,
+  like SP500's BRK-B).
 - **FX**: today's rate, applied to ALL historical prices. User chose this
   over historical rates. Trade-off accepted: mixes price movement with FX
   movement on non-EUR stocks.
@@ -301,18 +326,23 @@ smoke test.
 - Throttling and chunk delays — Yahoo will rate-limit aggressively if
   removed.
 - The two-jobs architecture (`rebuild_inventory` + `get_quotes`) and the
-  single persistent `stocks.xlsm`. Substantial deviations require the
-  user's say-so.
-- Cosmetic preservation: `init-workbook` re-runs must NOT clobber
-  user-modified label text, fonts, or column widths. The `overwrite`
-  kwarg on `_layout_*` is the protection.
-- The Portfolio is **Symbol + Notes** only (no Quantity column). The
-  user removed Quantity in 2026-05; do not add it back.
+  single persistent `stocks_picker_v{NN}.xlsm`. Substantial deviations
+  require the user's say-so.
+- Cosmetic preservation: `init-workbook` re-runs must NOT touch any cell
+  on the Main sheet — neither rewrite default labels (even if cleared)
+  nor restyle. Same rule applies to Help (append-only). Market and
+  Currencies/Monthly-movers header text IS re-asserted (column-name
+  contract) but bold + fill + widths are gated on fresh creation.
+- The Portfolio is **Symbol + Notes** only (no Quantity column).
 - The Test-mode control is a real Excel checkbox (added by
-  `setup-buttons`) with LinkedCell=Main!B5 — don't replace it with a
-  text cell again.
+  `setup-buttons`) with LinkedCell=Main!B5.
 - Error reporting is log file + Errors sheet + Status cell. Do NOT
   re-introduce the truncated VBA MsgBox by re-raising from `button_*`.
+- Market AutoFilter must be re-applied to the new data extent on every
+  rebuild — the user's sort/filter survives that way.
+- New sheets (Help / Currencies / Monthly movers) are populated by the
+  scripts but their styling/widths are set only on FIRST creation
+  (cosmetic preservation rule applies).
 
 ## Conventions
 
