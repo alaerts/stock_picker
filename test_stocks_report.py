@@ -9,11 +9,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stocks_report import (  # noqa: E402
+    CURRENCY_HEADERS,
     ETF_LIST,
+    FX_PAIRS,
     MAIN_CELLS,
     MARKET_COLUMNS,
+    MOVERS_HEADERS,
     PORTFOLIO_FIRST_ROW,
+    SCHEMA_VERSION,
+    VERSION_HISTORY,
     _append_error_log,
+    _compute_monthly_movers,
+    _currency_rows,
+    _ensure_help_sheet_versions,
     _extract_dataroma_tickers,
     _owned_for,
     _parse_bel20_ticker,
@@ -21,6 +29,7 @@ from stocks_report import (  # noqa: E402
     _pct_change,
     _pct_column_pairs,
     _pick_test_target,
+    _resolve_workbook,
     aggregate_constituents,
     get_etfs,
     init_workbook,
@@ -239,7 +248,7 @@ def test_init_workbook_creates_main_and_market(tmp_path):
     init_workbook(path)
     assert path.exists()
     wb = load_workbook(path)
-    assert wb.sheetnames == ["Main", "Market"]
+    assert wb.sheetnames == ["Main", "Market", "Help"]
     # Market headers match MARKET_COLUMNS
     market = wb["Market"]
     headers = [market.cell(row=1, column=i).value for i in range(1, len(MARKET_COLUMNS) + 1)]
@@ -456,6 +465,156 @@ def test_market_columns_includes_pct_columns_interleaved():
                 f"After {name!r}, expected {label_short!r} %, got "
                 f"{MARKET_COLUMNS[i+1]!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Schema version, VERSION_HISTORY, _resolve_workbook
+# ---------------------------------------------------------------------------
+
+def test_schema_version_string_format():
+    """v01, v02, ... — letter v then digits."""
+    assert SCHEMA_VERSION.startswith("v")
+    assert SCHEMA_VERSION[1:].isdigit()
+
+
+def test_version_history_includes_current_schema():
+    """Every released SCHEMA_VERSION must have a VERSION_HISTORY entry."""
+    versions = {v for v, _date, _msg in VERSION_HISTORY}
+    assert SCHEMA_VERSION in versions, (
+        f"SCHEMA_VERSION={SCHEMA_VERSION!r} missing from VERSION_HISTORY"
+    )
+
+
+def test_version_history_unique_keys():
+    versions = [v for v, _date, _msg in VERSION_HISTORY]
+    assert len(versions) == len(set(versions)), "Duplicate version in VERSION_HISTORY"
+
+
+def test_resolve_workbook_uses_explicit_path_when_not_default(tmp_path):
+    """A non-default --workbook always wins, even if a versioned file exists."""
+    user_path = tmp_path / "my_custom.xlsm"
+    assert _resolve_workbook(str(user_path)) == user_path
+
+
+def test_resolve_workbook_finds_highest_version(tmp_path, monkeypatch):
+    """When the caller passes our DEFAULT_WORKBOOK_PATH, pick the existing
+    stocks_picker_vNN.xlsm with the highest NN."""
+    from stocks_report import DEFAULT_WORKBOOK_PATH
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "stocks_picker_v01.xlsm").touch()
+    (tmp_path / "stocks_picker_v03.xlsm").touch()
+    (tmp_path / "stocks_picker_v02.xlsm").touch()
+    out = _resolve_workbook(str(DEFAULT_WORKBOOK_PATH))
+    assert out.name == "stocks_picker_v03.xlsm"
+
+
+def test_resolve_workbook_falls_back_to_legacy_xlsm(tmp_path, monkeypatch):
+    from stocks_report import DEFAULT_WORKBOOK_PATH
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "stocks.xlsm").touch()
+    out = _resolve_workbook(str(DEFAULT_WORKBOOK_PATH))
+    assert out.name == "stocks.xlsm"
+
+
+# ---------------------------------------------------------------------------
+# Help-sheet population
+# ---------------------------------------------------------------------------
+
+def test_ensure_help_sheet_versions_appends_missing(tmp_path):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Help"
+    _ensure_help_sheet_versions(ws, fresh=True)
+    # Every entry in VERSION_HISTORY should appear in column A
+    col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+    for ver, _date, _msg in VERSION_HISTORY:
+        assert ver in col_a, f"{ver} missing from Help sheet"
+
+
+def test_ensure_help_sheet_versions_preserves_user_credit_line(tmp_path):
+    """User has a credit line at A1; our entries get appended below."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "Developed by Claude"
+    _ensure_help_sheet_versions(ws, fresh=False)
+    assert ws["A1"].value == "Developed by Claude", "user credit clobbered"
+    col_a_below = [ws.cell(row=r, column=1).value for r in range(2, ws.max_row + 1)]
+    for ver, _date, _msg in VERSION_HISTORY:
+        assert ver in col_a_below
+
+
+def test_ensure_help_sheet_versions_does_not_duplicate(tmp_path):
+    """Running twice does not re-append already-mentioned versions."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    _ensure_help_sheet_versions(ws, fresh=True)
+    rows_after_first = ws.max_row
+    _ensure_help_sheet_versions(ws, fresh=False)
+    assert ws.max_row == rows_after_first, "second call appended duplicate entries"
+
+
+# ---------------------------------------------------------------------------
+# Currencies sheet helpers
+# ---------------------------------------------------------------------------
+
+def test_chf_is_in_fx_pairs():
+    assert "CHF" in FX_PAIRS
+    assert FX_PAIRS["CHF"] == "EURCHF=X"
+
+
+def test_currency_headers_match_lookbacks():
+    """Pair + every LOOKBACKS entry."""
+    from stocks_report import LOOKBACKS
+    assert CURRENCY_HEADERS == ["Pair"] + list(LOOKBACKS.keys())
+
+
+def test_currency_rows_one_per_pair(tmp_path):
+    """_currency_rows produces one row per FX_PAIRS entry, each starting with
+    "EUR/{ccy}" and having a value per LOOKBACKS column."""
+    from stocks_report import LOOKBACKS
+    fake_history = {ccy: pd.Series(dtype=float) for ccy in FX_PAIRS}
+    rows = _currency_rows(fake_history)
+    assert len(rows) == len(FX_PAIRS)
+    for r in rows:
+        assert len(r) == 1 + len(LOOKBACKS)
+        assert r[0].startswith("EUR/")
+
+
+# ---------------------------------------------------------------------------
+# Monthly movers
+# ---------------------------------------------------------------------------
+
+def test_compute_monthly_movers_filters_and_sorts():
+    """Filter: 1D/1W/1M all positive. Sort: 1M desc."""
+    records = [
+        {"symbol": "A", "pct_1d": 0.01,  "pct_1w": 0.02,  "pct_1m": 0.10},  # qualifies
+        {"symbol": "B", "pct_1d": 0.01,  "pct_1w": 0.02,  "pct_1m": 0.05},  # qualifies, lower 1M
+        {"symbol": "C", "pct_1d": -0.01, "pct_1w": 0.05,  "pct_1m": 0.20},  # 1D negative — skip
+        {"symbol": "D", "pct_1d": 0.01,  "pct_1w": -0.01, "pct_1m": 0.30},  # 1W negative — skip
+        {"symbol": "E", "pct_1d": 0.01,  "pct_1w": 0.01,  "pct_1m": -0.05}, # 1M negative — skip
+        {"symbol": "F", "pct_1d": None,  "pct_1w": 0.01,  "pct_1m": 0.10},  # missing — skip
+    ]
+    out = _compute_monthly_movers(records, top_n=10)
+    # Only A and B qualify; A first (1M = 10% > 5%).
+    assert [r["symbol"] for r in out] == ["A", "B"]
+
+
+def test_compute_monthly_movers_respects_top_n():
+    records = [
+        {"symbol": f"X{i}", "pct_1d": 0.01, "pct_1w": 0.01, "pct_1m": i / 100.0}
+        for i in range(1, 11)
+    ]
+    out = _compute_monthly_movers(records, top_n=3)
+    assert len(out) == 3
+    assert [r["symbol"] for r in out] == ["X10", "X9", "X8"]
+
+
+def test_movers_headers_includes_required_columns():
+    for col in ("Symbol", "Today (EUR)", "1D %", "1W %", "1M %"):
+        assert col in MOVERS_HEADERS
 
 
 def test_init_workbook_portfolio_header_has_no_quantity(tmp_path):

@@ -192,7 +192,7 @@ DATAROMA_ACTIVIST_CODES = [
 DATAROMA_BASE = "https://www.dataroma.com"
 
 # FX: 1 EUR = X foreign currency, so foreign_in_eur = foreign_price / rate
-FX_PAIRS = {"USD": "EURUSD=X", "JPY": "EURJPY=X", "GBP": "EURGBP=X"}
+FX_PAIRS = {"USD": "EURUSD=X", "JPY": "EURJPY=X", "GBP": "EURGBP=X", "CHF": "EURCHF=X"}
 
 LOOKBACKS = {
     "Today":   dt.timedelta(days=0),
@@ -569,6 +569,31 @@ def get_fx_rates() -> dict[str, float]:
     rates["GBp"] = rates.get("GBP", float("nan"))
     return rates
 
+
+def get_fx_history() -> dict[str, pd.Series]:
+    """Returns {currency_code: Close-price Series indexed by date} for the
+    full 5-year+ lookback window. Used to populate the Currencies sheet at
+    each LOOKBACKS offset.
+
+    Failed currencies map to an empty Series; price_at_or_before then
+    returns None for those rows. The job never crashes on FX failure.
+    """
+    today = dt.date.today()
+    start = today - dt.timedelta(days=int(5.2 * 365))
+    end = today + dt.timedelta(days=1)
+    out: dict[str, pd.Series] = {}
+    log.info("Fetching FX history (5y)")
+    for ccy, symbol in FX_PAIRS.items():
+        try:
+            hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=False)
+            if hist.empty:
+                raise RuntimeError("empty FX history")
+            out[ccy] = hist["Close"].dropna()
+        except Exception as e:
+            log.error(f"  EUR/{ccy} history fetch failed: {e}")
+            out[ccy] = pd.Series(dtype=float)
+    return out
+
 def to_eur(price: float, currency: str, fx: dict[str, float]) -> Optional[float]:
     if price is None or pd.isna(price):
         return None
@@ -844,12 +869,36 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 #            (rebuild_inventory) overwrites this in full; Job 2 (get_quotes)
 #            updates the quote/PE/timestamp columns by Symbol key.
 
-DEFAULT_WORKBOOK_PATH = Path("stocks.xlsx")
+# Schema version. Bumped on major changes that add sheets, columns, or change
+# the data contract. The filename embeds this so the user can see at a glance
+# which generation of the script their workbook matches; the Help sheet renders
+# the changelog entries from VERSION_HISTORY below.
+SCHEMA_VERSION = "v02"
+
+# Append-only changelog. init-workbook appends any missing versions to the
+# Help sheet without touching user edits. Date is when the version was minted.
+VERSION_HISTORY: list[tuple[str, str, str]] = [
+    ("v01", "2026-05-13",
+     "Initial release. 7 indexes + 38 ETFs in Market. Watchlists from Yahoo "
+     "screener + dataroma. Symbol hyperlinks. % change columns. xlwings "
+     "buttons. Sheets: Main / Market / Help / xlwings.conf."),
+    ("v02", "2026-05-13",
+     "Help sheet now auto-populated from VERSION_HISTORY (append-only). New "
+     "Currencies sheet listing EUR / USD / JPY / GBP / CHF rates today + at "
+     "each lookback. New Monthly movers sheet ranking the biggest 1M gainers "
+     "that have NOT weakened over 1D or 1W. CHF added to FX_PAIRS. Market "
+     "AutoFilter is re-applied to the new data extent on rebuild."),
+]
+
+DEFAULT_WORKBOOK_PATH = Path(f"stocks_picker_{SCHEMA_VERSION}.xlsm")
 
 # Where button-triggered errors land. Lives next to the workbook so the user
 # can find it without leaving Excel.
 ERROR_LOG_FILENAME = "stocks_errors.log"
 ERRORS_SHEET_NAME = "Errors"
+HELP_SHEET_NAME = "Help"
+CURRENCIES_SHEET_NAME = "Currencies"
+MONTHLY_MOVERS_SHEET_NAME = "Monthly movers"
 
 
 def _append_error_log(log_path: Path, exc_type: str, message: str, traceback_text: str) -> None:
@@ -881,14 +930,35 @@ def yahoo_quote_url(symbol: str) -> str:
     return YAHOO_QUOTE_URL.format(symbol=symbol)
 
 
+_VERSIONED_FILENAME_RE = re.compile(r"^stocks_picker_v(\d+)\.xlsm$", re.IGNORECASE)
+
+
 def _resolve_workbook(arg_path: str) -> Path:
-    """Auto-upgrade: if the user kept the default 'stocks.xlsx' but
-    'stocks.xlsm' exists (i.e. setup-buttons has been run), use the xlsm.
-    Saves the user from having to pass --workbook stocks.xlsm everywhere.
+    """Smart default: when the caller passed our default path, prefer an
+    existing workbook over creating a new one.
+
+    Resolution order:
+      1. Highest-version stocks_picker_v{NN}.xlsm in the current directory.
+      2. stocks.xlsm (pre-versioning filename).
+      3. stocks.xlsx (the openpyxl-only filename before setup-buttons).
+      4. The caller's path verbatim.
+
+    A non-default explicit path always wins.
     """
     p = Path(arg_path)
-    if p == Path("stocks.xlsx") and Path("stocks.xlsm").exists():
+    if p != DEFAULT_WORKBOOK_PATH:
+        return p
+    candidates: list[tuple[int, Path]] = []
+    for f in Path(".").iterdir():
+        m = _VERSIONED_FILENAME_RE.match(f.name)
+        if m:
+            candidates.append((int(m.group(1)), f))
+    if candidates:
+        return max(candidates, key=lambda x: x[0])[1]
+    if Path("stocks.xlsm").exists():
         return Path("stocks.xlsm")
+    if Path("stocks.xlsx").exists():
+        return Path("stocks.xlsx")
     return p
 
 # Market sheet column order. Fixed by index — every part of the code that
@@ -1133,6 +1203,14 @@ def init_workbook(path: Path) -> Path:
     _layout_main_sheet(main_ws, overwrite=overwrite)
     _layout_market_sheet(market_ws, overwrite=overwrite)
 
+    # Ensure the Help sheet exists and contains a row for every entry in
+    # VERSION_HISTORY. Append-only — never modifies rows the user has edited.
+    if HELP_SHEET_NAME not in wb.sheetnames:
+        help_ws = wb.create_sheet(HELP_SHEET_NAME)
+    else:
+        help_ws = wb[HELP_SHEET_NAME]
+    _ensure_help_sheet_versions(help_ws, fresh=overwrite)
+
     # Test-mode cell is intentionally left blank on fresh workbooks — the
     # checkbox added by setup-buttons writes TRUE/FALSE into it. read_test_mode()
     # treats blank as False, so the workbook is usable even before setup-buttons.
@@ -1142,6 +1220,62 @@ def init_workbook(path: Path) -> Path:
     wb.save(path)
     log.info(f"Workbook ready: {path.resolve()}")
     return path
+
+
+def _ensure_help_sheet_versions(ws: Worksheet, *, fresh: bool) -> None:
+    """Make sure every entry in VERSION_HISTORY has a row on the Help sheet.
+
+    Append-only: if a version is already mentioned anywhere in column A
+    (e.g. the user manually rewrote its row), we leave it alone. New
+    version entries get appended below the sheet's last non-empty row.
+
+    On fresh creation (``fresh=True``) we also set a sensible column width
+    for the summary so it's readable without wrap. Existing workbooks keep
+    whatever widths the user has chosen.
+    """
+    # Determine which versions are already on the sheet (case-insensitive
+    # match anywhere in column A).
+    mentioned: set[str] = set()
+    last_used_row = 0
+    max_row = ws.max_row if ws.max_row else 0
+    for r in range(1, max_row + 1):
+        v = ws.cell(row=r, column=1).value
+        if v is not None:
+            last_used_row = r
+            if isinstance(v, str):
+                token = v.strip().lower()
+                for ver, _date, _summary in VERSION_HISTORY:
+                    if token == ver.lower():
+                        mentioned.add(ver)
+    # Append missing entries one row past the last used row, with a blank
+    # spacer between user content and our changelog if appropriate.
+    next_row = last_used_row + 1 if last_used_row else 1
+    if mentioned:
+        # Some history exists already; append right after the last used row.
+        pass
+    elif last_used_row > 0:
+        # User has prior content (e.g. their credit line) but no version
+        # entries yet — leave a blank spacer for visual separation.
+        next_row = last_used_row + 2
+
+    appended = 0
+    for ver, date, summary in VERSION_HISTORY:
+        if ver in mentioned:
+            continue
+        ws.cell(row=next_row, column=1, value=ver).font = Font(bold=True)
+        ws.cell(row=next_row, column=2, value=date)
+        c = ws.cell(row=next_row, column=3, value=summary)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        next_row += 1
+        appended += 1
+
+    if fresh and appended > 0:
+        # Sensible widths only on a brand-new sheet; respect user widths after.
+        ws.column_dimensions["A"].width = 10
+        ws.column_dimensions["B"].width = 14
+        ws.column_dimensions["C"].width = 120
+    if appended:
+        log.info(f"  Help sheet: appended {appended} version entr{'y' if appended == 1 else 'ies'}")
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +1398,14 @@ def rebuild_inventory(
         for _past_label, pct_col in _pct_column_pairs():
             market_ws.cell(row=row, column=cols[pct_col]).number_format = PERCENT_STYLE
         # Quote values and Last update/error are left blank for get_quotes.
+
+    # Re-apply AutoFilter to span the new data extent. If the user has
+    # previously enabled Filter/Sort on Market, openpyxl preserves the
+    # auto_filter object but its ref still points at the OLD row count
+    # after we delete/append data — fix it explicitly.
+    last_col_letter = get_column_letter(len(MARKET_COLUMNS))
+    last_data_row = 1 + len(constituents)
+    market_ws.auto_filter.ref = f"A1:{last_col_letter}{last_data_row}"
 
     # Update Main metadata cells
     main_ws = wb["Main"]
@@ -1469,6 +1611,14 @@ def button_rebuild_inventory() -> None:
             desc_letter = get_column_letter(MARKET_COLUMNS.index("Description") + 1)
             market.range(f"{desc_letter}2:{desc_letter}{last_row}").api.WrapText = False
 
+            # Re-apply AutoFilter to span the new data extent. Replaces any
+            # prior filter range so it stays in sync with row count.
+            last_col_letter = get_column_letter(len(MARKET_COLUMNS))
+            data_range = market.range(f"A1:{last_col_letter}{last_row}")
+            if market.api.AutoFilterMode:
+                market.api.AutoFilterMode = False  # clear, then re-apply
+            data_range.api.AutoFilter()
+
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         main.range(MAIN_CELLS["LastRebuildAt"]).value = now_iso
         main.range(MAIN_CELLS["MarketRowCount"]).value = len(rows)
@@ -1527,8 +1677,10 @@ def button_get_quotes() -> None:
         else:
             targets = market_rows
 
-        status("Fetching FX rates")
+        status("Fetching FX rates + history")
         fx = get_fx_rates()
+        fx_history = get_fx_history()
+        _ensure_currencies_sheet_xlwings(wb, fx_history)
 
         status(f"Downloading price history for {len(targets)} tickers")
         today = dt.date.today()
@@ -1550,7 +1702,8 @@ def button_get_quotes() -> None:
 
         ok = 0
         fail = 0
-        for (row_idx, sym, ccy, _idx) in targets:
+        movers_input: list[dict] = []
+        for (row_idx, sym, ccy, indexes_csv) in targets:
             try:
                 series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
                 eur_by_label = {}
@@ -1561,9 +1714,12 @@ def button_get_quotes() -> None:
                     eur_by_label[label] = eur
                     market.range((row_idx, cols[f"{label} (EUR)"])).value = eur
                 today_eur = eur_by_label.get("Today")
+                pct_by_short = {}
                 for past_label, pct_col in _pct_column_pairs():
+                    pct = _pct_change(today_eur, eur_by_label.get(past_label))
+                    pct_by_short[pct_col] = pct
                     rng = market.range((row_idx, cols[pct_col]))
-                    rng.value = _pct_change(today_eur, eur_by_label.get(past_label))
+                    rng.value = pct
                     rng.api.NumberFormat = PERCENT_STYLE
                 info = info_map.get(sym, {})
                 market.range((row_idx, cols["P/E (TTM)"])).value   = info.get("trailingPE")
@@ -1571,9 +1727,25 @@ def button_get_quotes() -> None:
                 market.range((row_idx, cols["Last update (UTC)"])).value = now_iso
                 market.range((row_idx, cols["Last error"])).value = None
                 ok += 1
+
+                movers_input.append({
+                    "symbol":  sym,
+                    "name":    market.range((row_idx, cols["Name"])).value,
+                    "indexes": indexes_csv,
+                    "sector":  market.range((row_idx, cols["Sector"])).value,
+                    "today":   today_eur,
+                    "pct_1d":  pct_by_short.get("1D %"),
+                    "pct_1w":  pct_by_short.get("1W %"),
+                    "pct_1m":  pct_by_short.get("1M %"),
+                })
             except Exception as e:
                 market.range((row_idx, cols["Last error"])).value = f"{type(e).__name__}: {e}"[:300]
                 fail += 1
+
+        # Monthly movers — rank and write after the per-row loop.
+        movers = _compute_monthly_movers(movers_input)
+        status(f"Monthly movers: {len(movers)} of {len(movers_input)} qualify")
+        _ensure_monthly_movers_sheet_xlwings(wb, movers)
 
         main.range(MAIN_CELLS["LastQuotesAt"]).value = now_iso
         if not test_mode:
@@ -1587,6 +1759,207 @@ def button_get_quotes() -> None:
         status(f"quotes: done. {ok} ok, {fail} failed at {now_iso}.")
     except Exception as e:
         _handle_button_exception(wb, "get_quotes", e, _tb.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Currencies sheet — populated by get_quotes after FX history is fetched
+# ---------------------------------------------------------------------------
+
+CURRENCY_HEADERS = ["Pair"] + list(LOOKBACKS.keys())  # "Pair", "Today", "1D ago", ...
+FX_RATE_FORMAT = "#,##0.0000"  # FX needs more precision than equities
+
+
+def _currency_rows(fx_history: dict[str, pd.Series]) -> list[list]:
+    """One row per FX pair: ["EUR/USD", rate_today, rate_1d_ago, ...]."""
+    today_d = dt.date.today()
+    rows: list[list] = []
+    for ccy in FX_PAIRS:  # iteration order = display order in the sheet
+        hist = fx_history.get(ccy, pd.Series(dtype=float))
+        row: list = [f"EUR/{ccy}"]
+        for _label, delta in LOOKBACKS.items():
+            row.append(price_at_or_before(hist, today_d - delta))
+        rows.append(row)
+    return rows
+
+
+def _ensure_currencies_sheet_openpyxl(wb, fx_history: dict[str, pd.Series]) -> None:
+    """Write/refresh the Currencies sheet using openpyxl (CLI path)."""
+    if CURRENCIES_SHEET_NAME not in wb.sheetnames:
+        ws = wb.create_sheet(CURRENCIES_SHEET_NAME)
+        is_new = True
+    else:
+        ws = wb[CURRENCIES_SHEET_NAME]
+        is_new = False
+
+    # Header — re-assert text (column-name contract) but apply styling/widths
+    # only on first creation so user cosmetics survive.
+    for col_idx, name in enumerate(CURRENCY_HEADERS, 1):
+        cell = ws.cell(row=1, column=col_idx)
+        if is_new or cell.value != name:
+            cell.value = name
+        if is_new:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="F2F2F2")
+    if is_new:
+        ws.freeze_panes = "B2"
+        ws.column_dimensions["A"].width = 12
+        for col_idx in range(2, len(CURRENCY_HEADERS) + 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = 13
+
+    # Data rows
+    rows = _currency_rows(fx_history)
+    for r_offset, row in enumerate(rows, 0):
+        for c_offset, val in enumerate(row, 0):
+            cell = ws.cell(row=2 + r_offset, column=1 + c_offset, value=val)
+            if c_offset > 0:
+                cell.number_format = FX_RATE_FORMAT
+    # Trim any data rows from a prior run that exceed the current pair count.
+    for r in range(2 + len(rows), ws.max_row + 1):
+        for c in range(1, len(CURRENCY_HEADERS) + 1):
+            ws.cell(row=r, column=c).value = None
+
+
+def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) -> None:
+    """Write/refresh the Currencies sheet using xlwings (button path)."""
+    sheet_names = [s.name for s in wb_xw.sheets]
+    if CURRENCIES_SHEET_NAME not in sheet_names:
+        cur = wb_xw.sheets.add(CURRENCIES_SHEET_NAME, after=wb_xw.sheets[wb_xw.sheets.count - 1])
+        is_new = True
+    else:
+        cur = wb_xw.sheets[CURRENCIES_SHEET_NAME]
+        is_new = False
+    # Header
+    cur.range("A1").value = [CURRENCY_HEADERS]
+    if is_new:
+        cur.range(f"A1:{get_column_letter(len(CURRENCY_HEADERS))}1").api.Font.Bold = True
+        cur.api.Range("A2").Select()  # ignored; intent is to freeze
+        cur.api.Application.ActiveWindow.FreezePanes = False
+        # Use COM Window object for freeze pane
+    # Data
+    rows = _currency_rows(fx_history)
+    cur.range((2, 1)).value = rows
+    # Number format on numeric columns
+    last_col_letter = get_column_letter(len(CURRENCY_HEADERS))
+    cur.range(f"B2:{last_col_letter}{1 + len(rows)}").api.NumberFormat = FX_RATE_FORMAT
+    if is_new:
+        cur.range("A:A").api.ColumnWidth = 12
+        for col_idx in range(2, len(CURRENCY_HEADERS) + 1):
+            cur.range(f"{get_column_letter(col_idx)}:{get_column_letter(col_idx)}").api.ColumnWidth = 13
+
+
+# ---------------------------------------------------------------------------
+# Monthly movers sheet — top 1M gainers with no 1D/1W weakness
+# ---------------------------------------------------------------------------
+
+MOVERS_HEADERS = ["Symbol", "Name", "Indexes", "Sector",
+                  "Today (EUR)", "1D %", "1W %", "1M %"]
+MONTHLY_MOVERS_TOP_N = 50
+
+
+def _compute_monthly_movers(records: list[dict], top_n: int = MONTHLY_MOVERS_TOP_N) -> list[dict]:
+    """Filter to rows whose 1D %, 1W %, AND 1M % are all strictly positive,
+    then sort by 1M % descending and return the top N.
+
+    Records are dicts with keys: symbol, name, indexes, sector, today,
+    pct_1d, pct_1w, pct_1m.
+    """
+    candidates = [
+        r for r in records
+        if (r.get("pct_1d") is not None and r["pct_1d"] > 0
+            and r.get("pct_1w") is not None and r["pct_1w"] > 0
+            and r.get("pct_1m") is not None and r["pct_1m"] > 0)
+    ]
+    candidates.sort(key=lambda r: r["pct_1m"], reverse=True)
+    return candidates[:top_n]
+
+
+def _ensure_monthly_movers_sheet_openpyxl(wb, movers: list[dict]) -> None:
+    """Write/refresh the Monthly movers sheet via openpyxl (CLI path)."""
+    if MONTHLY_MOVERS_SHEET_NAME not in wb.sheetnames:
+        ws = wb.create_sheet(MONTHLY_MOVERS_SHEET_NAME)
+        is_new = True
+    else:
+        ws = wb[MONTHLY_MOVERS_SHEET_NAME]
+        is_new = False
+
+    for col_idx, name in enumerate(MOVERS_HEADERS, 1):
+        cell = ws.cell(row=1, column=col_idx)
+        if is_new or cell.value != name:
+            cell.value = name
+        if is_new:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="F2F2F2")
+    if is_new:
+        ws.freeze_panes = "A2"
+        widths = {"Symbol": 10, "Name": 28, "Indexes": 18, "Sector": 22,
+                  "Today (EUR)": 12, "1D %": 9, "1W %": 9, "1M %": 9}
+        for col_idx, name in enumerate(MOVERS_HEADERS, 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
+
+    # Clear any prior data rows from a previous run, then write new ones.
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, len(MOVERS_HEADERS) + 1):
+            ws.cell(row=r, column=c).value = None
+    for r_offset, m in enumerate(movers, 0):
+        row = 2 + r_offset
+        sym = m["symbol"]
+        sym_cell = ws.cell(row=row, column=1, value=sym)
+        sym_cell.hyperlink = yahoo_quote_url(sym)
+        sym_cell.style = "Hyperlink"
+        ws.cell(row=row, column=2, value=m.get("name") or "")
+        ws.cell(row=row, column=3, value=m.get("indexes") or "")
+        ws.cell(row=row, column=4, value=m.get("sector") or "")
+        c5 = ws.cell(row=row, column=5, value=m.get("today"))
+        c5.number_format = COMMA_STYLE
+        for pct_col_idx, key in ((6, "pct_1d"), (7, "pct_1w"), (8, "pct_1m")):
+            cell = ws.cell(row=row, column=pct_col_idx, value=m.get(key))
+            cell.number_format = PERCENT_STYLE
+
+
+def _ensure_monthly_movers_sheet_xlwings(wb_xw, movers: list[dict]) -> None:
+    """Write/refresh the Monthly movers sheet via xlwings (button path)."""
+    sheet_names = [s.name for s in wb_xw.sheets]
+    if MONTHLY_MOVERS_SHEET_NAME not in sheet_names:
+        mv = wb_xw.sheets.add(MONTHLY_MOVERS_SHEET_NAME, after=wb_xw.sheets[wb_xw.sheets.count - 1])
+        is_new = True
+    else:
+        mv = wb_xw.sheets[MONTHLY_MOVERS_SHEET_NAME]
+        is_new = False
+
+    mv.range("A1").value = [MOVERS_HEADERS]
+    if is_new:
+        mv.range(f"A1:{get_column_letter(len(MOVERS_HEADERS))}1").api.Font.Bold = True
+
+    # Wipe prior data rows + write new ones in one bulk write.
+    last_row_now = mv.used_range.last_cell.row
+    if last_row_now >= 2:
+        mv.range(f"A2:{get_column_letter(len(MOVERS_HEADERS))}{last_row_now}").clear()
+
+    if movers:
+        rows = []
+        for m in movers:
+            rows.append([
+                m["symbol"],
+                m.get("name") or "",
+                m.get("indexes") or "",
+                m.get("sector") or "",
+                m.get("today"),
+                m.get("pct_1d"),
+                m.get("pct_1w"),
+                m.get("pct_1m"),
+            ])
+        mv.range((2, 1)).value = rows
+        last_row = 1 + len(rows)
+        mv.range(f"E2:E{last_row}").api.NumberFormat = COMMA_STYLE
+        mv.range(f"F2:H{last_row}").api.NumberFormat = PERCENT_STYLE
+        # Hyperlink each symbol cell
+        for offset, m in enumerate(movers):
+            cell = mv.range((2 + offset, 1))
+            mv.api.Hyperlinks.Add(
+                Anchor=cell.api,
+                Address=yahoo_quote_url(m["symbol"]),
+                TextToDisplay=m["symbol"],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1680,8 +2053,10 @@ def get_quotes(
     else:
         targets = market_rows
 
-    _say("Fetching FX rates")
+    _say("Fetching FX rates + history")
     fx = get_fx_rates()
+    fx_history = get_fx_history()
+    _ensure_currencies_sheet_openpyxl(wb, fx_history)
 
     _say(f"Downloading price history for {len(targets)} tickers")
     today = dt.date.today()
@@ -1703,7 +2078,8 @@ def get_quotes(
 
     successes = 0
     failures = 0
-    for (row_idx, sym, ccy, _indexes) in targets:
+    movers_input: list[dict] = []
+    for (row_idx, sym, ccy, indexes_csv) in targets:
         try:
             series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
             eur_by_label: dict[str, Optional[float]] = {}
@@ -1715,11 +2091,11 @@ def get_quotes(
                 market_ws.cell(row=row_idx, column=cols[f"{label} (EUR)"], value=eur)
             # % change vs Today for each non-Today lookback
             today_eur = eur_by_label.get("Today")
+            pct_by_short: dict[str, Optional[float]] = {}
             for past_label, pct_col in _pct_column_pairs():
-                cell = market_ws.cell(
-                    row=row_idx, column=cols[pct_col],
-                    value=_pct_change(today_eur, eur_by_label.get(past_label)),
-                )
+                pct = _pct_change(today_eur, eur_by_label.get(past_label))
+                pct_by_short[pct_col] = pct
+                cell = market_ws.cell(row=row_idx, column=cols[pct_col], value=pct)
                 cell.number_format = PERCENT_STYLE
             info = info_map.get(sym, {})
             market_ws.cell(row=row_idx, column=cols["P/E (TTM)"],   value=info.get("trailingPE"))
@@ -1727,10 +2103,28 @@ def get_quotes(
             market_ws.cell(row=row_idx, column=cols["Last update (UTC)"], value=now_iso)
             market_ws.cell(row=row_idx, column=cols["Last error"], value=None)  # clear previous
             successes += 1
+
+            # Capture for Monthly movers ranking. Read Name + Sector from the
+            # sheet (rebuild_inventory wrote them; we don't have them in scope).
+            movers_input.append({
+                "symbol":  sym,
+                "name":    market_ws.cell(row=row_idx, column=cols["Name"]).value,
+                "indexes": indexes_csv,
+                "sector":  market_ws.cell(row=row_idx, column=cols["Sector"]).value,
+                "today":   today_eur,
+                "pct_1d":  pct_by_short.get("1D %"),
+                "pct_1w":  pct_by_short.get("1W %"),
+                "pct_1m":  pct_by_short.get("1M %"),
+            })
         except Exception as e:
             market_ws.cell(row=row_idx, column=cols["Last error"], value=f"{type(e).__name__}: {e}"[:300])
             failures += 1
             log.warning(f"  {sym}: {e}")
+
+    # After the per-row loop: rank movers and write the sheet.
+    movers = _compute_monthly_movers(movers_input)
+    _say(f"Monthly movers: {len(movers)} of {len(movers_input)} qualify (1D/1W/1M all positive)")
+    _ensure_monthly_movers_sheet_openpyxl(wb, movers)
 
     # Update Main metadata
     main_ws[MAIN_CELLS["LastQuotesAt"]] = now_iso

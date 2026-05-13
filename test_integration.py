@@ -18,11 +18,13 @@ import pytest
 from stocks_report import (
     DATAROMA_ACTIVIST_CODES,
     ETF_LIST,
+    FX_PAIRS,
     INDEX_WIKI,
     fetch_close_prices,
     fetch_dataroma_activist_aggregate,
     fetch_dataroma_tickers,
     fetch_yahoo_screener,
+    get_fx_history,
     get_fx_rates,
     get_index_constituents,
     _yahoo_screener_session,
@@ -202,9 +204,27 @@ def test_fx_rates_are_plausible():
     """Each currency rate (against EUR) must come back as a sane positive
     number. Catches: yfinance breakage, FX symbol rename, network."""
     rates = get_fx_rates()
-    for ccy, (lo, hi) in {"USD": (0.5, 2.0), "JPY": (80.0, 300.0), "GBP": (0.5, 1.5)}.items():
+    bounds = {
+        "USD": (0.5, 2.0),
+        "JPY": (80.0, 300.0),
+        "GBP": (0.5, 1.5),
+        "CHF": (0.5, 1.5),
+    }
+    for ccy, (lo, hi) in bounds.items():
         rate = rates.get(ccy)
         assert rate is not None, f"EUR/{ccy} missing from rates"
         assert lo <= rate <= hi, (
             f"EUR/{ccy} = {rate}, outside plausible range [{lo}, {hi}]"
+        )
+
+
+def test_fx_history_returns_series_for_each_pair():
+    """get_fx_history must return a non-empty Close-price Series per pair
+    so the Currencies sheet can resolve every lookback."""
+    history = get_fx_history()
+    for ccy in FX_PAIRS:
+        assert ccy in history, f"{ccy} missing from FX history"
+        series = history[ccy]
+        assert len(series) >= 100, (
+            f"EUR/{ccy} returned only {len(series)} datapoints — expected ~1300"
         )
