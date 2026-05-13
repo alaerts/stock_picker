@@ -2229,14 +2229,34 @@ def _cmd_setup_buttons(args) -> int:
         if bas_path.exists():
             try:
                 vbproject = wb.api.VBProject
-                # Remove any existing copy first so import doesn't duplicate the
-                # module under a different name (Excel renames to stocks_picker1
-                # / 2 / etc. on conflict).
-                try:
-                    existing = vbproject.VBComponents("stocks_picker")
-                    vbproject.VBComponents.Remove(existing)
-                except Exception:
-                    pass  # didn't exist — fine
+                # Remove every existing std-module that defines our macros —
+                # catches not only "stocks_picker" but also stale duplicates
+                # under names Excel made up on prior conflicts (Module1,
+                # stocks_picker1, etc.). Without this, re-running this command
+                # produces the "Ambiguous name detected: RebuildInventory"
+                # error when the user clicks a button.
+                signatures = ("Sub RebuildInventory", "Sub GetQuotes")
+                doomed: list = []
+                for i in range(1, vbproject.VBComponents.Count + 1):
+                    comp = vbproject.VBComponents.Item(i)
+                    if comp.Type != 1:  # 1 = vbext_ct_StdModule
+                        continue
+                    try:
+                        n_lines = comp.CodeModule.CountOfLines
+                        if n_lines == 0:
+                            continue
+                        code = comp.CodeModule.Lines(1, n_lines)
+                        if any(sig in code for sig in signatures):
+                            doomed.append(comp)
+                    except Exception:
+                        pass
+                for comp in doomed:
+                    log.info(f"  removing prior VBA module '{comp.Name}' "
+                             "(contained RebuildInventory / GetQuotes)")
+                    try:
+                        vbproject.VBComponents.Remove(comp)
+                    except Exception as e:
+                        log.warning(f"    couldn't remove {comp.Name}: {e}")
                 vbproject.VBComponents.Import(str(bas_path))
                 vba_imported = True
                 log.info(f"Imported VBA module from {bas_path.name}")
