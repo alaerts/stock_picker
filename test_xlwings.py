@@ -39,8 +39,22 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture(scope="module")
 def xw_app():
-    """A shared headless Excel app for the whole module — saves ~3s per test."""
+    """A shared headless Excel app for the whole module — saves ~3s per test.
+
+    **Safety:** if the user already has Excel running, we skip the entire
+    module. Creating a new App while another exists has, on some Excel/COM
+    version combos, caused `app.quit()` to also tear down the user's
+    sessions — and the cost of a false negative (lost work) dwarfs the
+    benefit of running these tests right now. Close Excel before running
+    `pytest --integration test_xlwings.py` if you want this layer covered.
+    """
     import xlwings as xw
+    if list(xw.apps):
+        pids = [a.pid for a in xw.apps]
+        pytest.skip(
+            f"Skipping xlwings tests — Excel is already running (PIDs {pids}). "
+            "Close Excel and re-run if you want this layer covered."
+        )
     app = xw.App(visible=False, add_book=False)
     yield app
     # Best-effort cleanup; close any leftover workbooks too.
