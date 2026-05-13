@@ -657,6 +657,105 @@ def test_migrate_monthly_movers_renames_legacy_sheet(tmp_path):
     assert wb2[MONTHLY_WINNERS_SHEET_NAME]["A1"].value == "had data"
 
 
+def test_get_quotes_test_mode_populates_ranking_on_unfilled_market(tmp_path, monkeypatch):
+    """Regression for 2026-05-13 (round 2): Monthly winners + losers were STILL
+    empty in test mode because:
+      - rebuild_inventory --test had previously wiped Market down to 5 rows
+        with NO quote data (only structural).
+      - get_quotes --test refreshed only 1 of those 5 → 4 rows with None
+        for the % columns → filtered out of the ranking → empty winners/losers.
+
+    The fix: test-mode get_quotes refreshes TOP N (=20) rows, not just 1.
+    Combined with a Market of at least a few rows (BEL20 + ETFs gives ~58),
+    the ranking has enough populated %s to produce a meaningful report.
+
+    This test deliberately seeds Market with rows that have NO %s (matching
+    the realistic state after a test-mode rebuild), runs get_quotes test
+    mode against it, and asserts the ranking ends up populated.
+    """
+    import datetime as dt
+    import pandas as pd
+    import stocks_report as sr
+    from openpyxl import load_workbook
+
+    path = tmp_path / "ranking_smoke.xlsx"
+    init_workbook(path)
+    wb = load_workbook(path)
+    market = wb["Market"]
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+
+    # Seed 30 Market rows with structural data only — no % columns
+    # populated. This mimics the state right after a test-mode rebuild
+    # before any get_quotes has run.
+    seed_count = 30
+    for r in range(2, 2 + seed_count):
+        sym = f"FAKE{r-2:02d}.X"
+        market.cell(row=r, column=cols["Symbol"], value=sym)
+        market.cell(row=r, column=cols["Name"], value=f"Fake {r-2}")
+        market.cell(row=r, column=cols["Currency"], value="EUR")
+        market.cell(row=r, column=cols["Owned?"], value="No")
+        market.cell(row=r, column=cols["Indexes"], value="BEL20")
+        # NOTE: deliberately no Today (EUR) / 1D % / etc. — they're None.
+    wb.save(path)
+
+    # Mock the network layer. fetch_close_prices returns deterministic
+    # series that produce a 50/50 mix of winners and losers under to_eur.
+    today = dt.date.today()
+    dates = pd.date_range(end=today, periods=400).normalize()
+
+    def mock_close_prices(tickers, *args, **kwargs):
+        data = {}
+        for i, t in enumerate(tickers):
+            base = 100.0
+            today_price = base * (1.15 if i % 2 == 0 else 0.85)  # winners vs losers
+            series = pd.Series(
+                [base] * (len(dates) - 1) + [today_price],
+                index=dates,
+            )
+            data[t] = series
+        return pd.concat(data, axis=1)
+
+    monkeypatch.setattr(sr, "fetch_close_prices", mock_close_prices)
+    monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw:
+                        {t: {"trailingPE": 15.0, "forwardPE": 14.0} for t in tickers})
+    monkeypatch.setattr(sr, "get_fx_rates", lambda: {
+        "EUR": 1.0, "USD": 1.1, "JPY": 165.0, "GBP": 0.85, "CHF": 1.0,
+        "GBp": 0.85,
+    })
+    monkeypatch.setattr(sr, "get_fx_history",
+                        lambda: {ccy: pd.Series(dtype=float)
+                                 for ccy in ("USD", "JPY", "GBP", "CHF")})
+
+    # Run get_quotes in test mode
+    result = sr.get_quotes(workbook_path=path, test_mode=True, info_delay=0.0)
+    assert result == 0, "get_quotes test mode returned non-zero"
+
+    wb2 = load_workbook(path)
+
+    # The first TEST_MODE_QUOTE_REFRESH_LIMIT rows must now have populated %s
+    refreshed_pct_count = 0
+    for r in range(2, 2 + min(seed_count, sr.TEST_MODE_QUOTE_REFRESH_LIMIT)):
+        if wb2["Market"].cell(row=r, column=cols["1M %"]).value is not None:
+            refreshed_pct_count += 1
+    assert refreshed_pct_count >= sr.TEST_MODE_QUOTE_REFRESH_LIMIT - 2, (
+        f"Only {refreshed_pct_count} rows have 1M %; expected ~{sr.TEST_MODE_QUOTE_REFRESH_LIMIT}. "
+        "Test mode is refreshing too few rows."
+    )
+
+    # The ranking sheets must exist AND have at least one data row each.
+    from stocks_report import MONTHLY_WINNERS_SHEET_NAME, MONTHLY_LOSERS_SHEET_NAME
+    assert MONTHLY_WINNERS_SHEET_NAME in wb2.sheetnames
+    assert MONTHLY_LOSERS_SHEET_NAME in wb2.sheetnames
+    winners = wb2[MONTHLY_WINNERS_SHEET_NAME]
+    losers = wb2[MONTHLY_LOSERS_SHEET_NAME]
+    assert winners.cell(row=2, column=1).value is not None, (
+        "Monthly winners is EMPTY after get_quotes test mode — this is the user's bug"
+    )
+    assert losers.cell(row=2, column=1).value is not None, (
+        "Monthly losers is EMPTY after get_quotes test mode — this is the user's bug"
+    )
+
+
 def test_rebuild_inventory_test_mode_preserves_market(tmp_path, monkeypatch):
     """Regression for 2026-05-13 'Monthly winners/losers empty in test mode'.
 

@@ -906,6 +906,14 @@ DEFAULT_WORKBOOK_PATH = Path(f"stocks_picker_{SCHEMA_VERSION}.xlsm")
 # .info loop is still exercised so any Yahoo regression surfaces.
 TEST_MODE_TICKER_LIMIT = 5
 
+# Test-mode get_quotes refreshes the top N Market rows (not just 1). Without
+# this, the post-loop ranking computation finds nothing useful: it reads all
+# Market rows, but if only 1 row has fresh quote data, the other rows have
+# None for the % columns and get filtered out → empty Monthly winners/losers.
+# 20 is a reasonable balance: ~5 sec for the .info loop, enough rows for
+# the ranking to find candidates even in a freshly-rebuilt Market.
+TEST_MODE_QUOTE_REFRESH_LIMIT = 20
+
 # Where button-triggered errors land. Lives next to the workbook so the user
 # can find it without leaving Excel.
 ERROR_LOG_FILENAME = "stocks_errors.log"
@@ -1856,12 +1864,26 @@ def button_get_quotes() -> None:
 
         portfolio = _xw_read_portfolio(main)
         if test_mode:
-            picked = _pick_test_target(market_rows, portfolio)
-            targets = [picked] if picked else []
+            # Refresh the top N Market rows so the post-loop ranking has
+            # populated data. Portfolio symbols come first so the user sees
+            # their own stocks refresh.
+            portfolio_first = []
+            rest = []
+            portfolio_upper = {p.upper() for p in portfolio}
+            for row in market_rows:
+                sym_u = row[1].upper()
+                root_u = re.sub(r"\.[A-Z]{1,3}$", "", sym_u)
+                if sym_u in portfolio_upper or root_u in portfolio_upper:
+                    portfolio_first.append(row)
+                else:
+                    rest.append(row)
+            ordered = portfolio_first + rest
+            targets = ordered[:TEST_MODE_QUOTE_REFRESH_LIMIT]
             if not targets:
-                status("Test mode: could not pick a target")
+                status("Test mode: Market is empty")
                 return
-            status(f"Test mode: refreshing {targets[0][1]} only")
+            status(f"Test mode: refreshing top {len(targets)} rows "
+                   f"({len(portfolio_first)} from portfolio)")
         else:
             targets = market_rows
 
@@ -2378,12 +2400,25 @@ def get_quotes(
         return 1
 
     if test_mode:
-        picked = _pick_test_target(market_rows, portfolio)
-        if picked is None:
-            log.error("Could not pick a test target.")
-            return 1
-        targets = [picked]
-        _say(f"Test mode: refreshing {targets[0][1]} only")
+        # Refresh the top N Market rows (not just 1). The post-loop ranking
+        # computation reads ALL Market rows; with only 1 refreshed it had
+        # nothing populated to rank on, producing empty Monthly winners/losers.
+        # Bring the user's portfolio symbol(s) to the front of the slice so
+        # the user sees their stock refresh first when they're watching.
+        portfolio_first = []
+        rest = []
+        portfolio_upper = {p.upper() for p in portfolio}
+        for row in market_rows:
+            sym_u = row[1].upper()
+            root_u = re.sub(r"\.[A-Z]{1,3}$", "", sym_u)
+            if sym_u in portfolio_upper or root_u in portfolio_upper:
+                portfolio_first.append(row)
+            else:
+                rest.append(row)
+        ordered = portfolio_first + rest
+        targets = ordered[:TEST_MODE_QUOTE_REFRESH_LIMIT]
+        _say(f"Test mode: refreshing top {len(targets)} rows "
+             f"({len(portfolio_first)} from portfolio)")
     else:
         targets = market_rows
 
