@@ -14,15 +14,20 @@ from stocks_report import (  # noqa: E402
     FX_PAIRS,
     MAIN_CELLS,
     MARKET_COLUMNS,
-    MOVERS_HEADERS,
+    MONTHLY_LOSERS_SHEET_NAME,
+    MONTHLY_MOVERS_LEGACY_NAME,
+    MONTHLY_WINNERS_SHEET_NAME,
     PORTFOLIO_FIRST_ROW,
+    RANKING_HEADERS,
     SCHEMA_VERSION,
     VERSION_HISTORY,
     _append_error_log,
-    _compute_monthly_movers,
+    _compute_monthly_losers,
+    _compute_monthly_winners,
     _currency_rows,
     _ensure_help_sheet_versions,
     _extract_dataroma_tickers,
+    _migrate_monthly_movers_to_winners_openpyxl,
     _owned_for,
     _parse_bel20_ticker,
     _parse_nikkei225_components,
@@ -587,34 +592,81 @@ def test_currency_rows_one_per_pair(tmp_path):
 # Monthly movers
 # ---------------------------------------------------------------------------
 
-def test_compute_monthly_movers_filters_and_sorts():
-    """Filter: 1D/1W/1M all positive. Sort: 1M desc."""
+def test_compute_monthly_winners_filters_and_sorts():
+    """Filter: 1D >= 0 AND 1W >= 0 AND 1M > 0. Sort: 1M desc."""
     records = [
         {"symbol": "A", "pct_1d": 0.01,  "pct_1w": 0.02,  "pct_1m": 0.10},  # qualifies
-        {"symbol": "B", "pct_1d": 0.01,  "pct_1w": 0.02,  "pct_1m": 0.05},  # qualifies, lower 1M
+        {"symbol": "B", "pct_1d": 0.01,  "pct_1w": 0.02,  "pct_1m": 0.05},  # qualifies
         {"symbol": "C", "pct_1d": -0.01, "pct_1w": 0.05,  "pct_1m": 0.20},  # 1D negative — skip
         {"symbol": "D", "pct_1d": 0.01,  "pct_1w": -0.01, "pct_1m": 0.30},  # 1W negative — skip
         {"symbol": "E", "pct_1d": 0.01,  "pct_1w": 0.01,  "pct_1m": -0.05}, # 1M negative — skip
         {"symbol": "F", "pct_1d": None,  "pct_1w": 0.01,  "pct_1m": 0.10},  # missing — skip
+        {"symbol": "G", "pct_1d": 0.0,   "pct_1w": 0.0,   "pct_1m": 0.07},  # zero 1D/1W is ok (>=0)
     ]
-    out = _compute_monthly_movers(records, top_n=10)
-    # Only A and B qualify; A first (1M = 10% > 5%).
-    assert [r["symbol"] for r in out] == ["A", "B"]
+    out = _compute_monthly_winners(records, top_n=10)
+    # A (10%), G (7%), B (5%) — order by 1M desc.
+    assert [r["symbol"] for r in out] == ["A", "G", "B"]
 
 
-def test_compute_monthly_movers_respects_top_n():
+def test_compute_monthly_winners_respects_top_n():
     records = [
         {"symbol": f"X{i}", "pct_1d": 0.01, "pct_1w": 0.01, "pct_1m": i / 100.0}
         for i in range(1, 11)
     ]
-    out = _compute_monthly_movers(records, top_n=3)
-    assert len(out) == 3
+    out = _compute_monthly_winners(records, top_n=3)
     assert [r["symbol"] for r in out] == ["X10", "X9", "X8"]
 
 
-def test_movers_headers_includes_required_columns():
-    for col in ("Symbol", "Today (EUR)", "1D %", "1W %", "1M %"):
-        assert col in MOVERS_HEADERS
+def test_compute_monthly_losers_filters_and_sorts():
+    """Filter: 1M < 0 AND 1D <= 0 AND 1W <= 0. Sort: 1M asc (worst first)."""
+    records = [
+        {"symbol": "A", "pct_1d": -0.01, "pct_1w": -0.02, "pct_1m": -0.10},  # qualifies
+        {"symbol": "B", "pct_1d": -0.01, "pct_1w": -0.02, "pct_1m": -0.05},  # qualifies, less bad
+        {"symbol": "C", "pct_1d": 0.01,  "pct_1w": -0.05, "pct_1m": -0.20},  # 1D positive — skip (bounce)
+        {"symbol": "D", "pct_1d": -0.01, "pct_1w": 0.01,  "pct_1m": -0.30},  # 1W positive — skip
+        {"symbol": "E", "pct_1d": -0.01, "pct_1w": -0.01, "pct_1m": 0.05},   # 1M positive — skip
+        {"symbol": "F", "pct_1d": None,  "pct_1w": -0.01, "pct_1m": -0.10},  # missing — skip
+        {"symbol": "G", "pct_1d": 0.0,   "pct_1w": 0.0,   "pct_1m": -0.07},  # zero 1D/1W ok (<=0)
+    ]
+    out = _compute_monthly_losers(records, top_n=10)
+    # A (-10%), G (-7%), B (-5%) — ascending = most negative first.
+    assert [r["symbol"] for r in out] == ["A", "G", "B"]
+
+
+def test_ranking_headers_includes_owned_and_required_columns():
+    for col in ("Symbol", "Owned?", "Today (EUR)", "1D %", "1W %", "1M %"):
+        assert col in RANKING_HEADERS
+
+
+def test_migrate_monthly_movers_renames_legacy_sheet(tmp_path):
+    """Workbook with old 'Monthly movers' sheet gets it renamed in place,
+    its content preserved."""
+    from openpyxl import Workbook, load_workbook
+    path = tmp_path / "legacy.xlsx"
+    wb = Workbook()
+    legacy = wb.active
+    legacy.title = MONTHLY_MOVERS_LEGACY_NAME
+    legacy["A1"] = "had data"
+    wb.save(path)
+    wb = load_workbook(path)
+    _migrate_monthly_movers_to_winners_openpyxl(wb)
+    wb.save(path)
+    wb2 = load_workbook(path)
+    assert MONTHLY_MOVERS_LEGACY_NAME not in wb2.sheetnames
+    assert MONTHLY_WINNERS_SHEET_NAME in wb2.sheetnames
+    assert wb2[MONTHLY_WINNERS_SHEET_NAME]["A1"].value == "had data"
+
+
+def test_migrate_monthly_movers_no_op_when_winners_already_exists(tmp_path):
+    """If both legacy and new names exist, migration must NOT clobber the
+    new sheet — leave the legacy one alone for the user to delete."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.active.title = MONTHLY_MOVERS_LEGACY_NAME
+    wb.create_sheet(MONTHLY_WINNERS_SHEET_NAME)
+    _migrate_monthly_movers_to_winners_openpyxl(wb)
+    assert MONTHLY_MOVERS_LEGACY_NAME in wb.sheetnames
+    assert MONTHLY_WINNERS_SHEET_NAME in wb.sheetnames
 
 
 def test_init_workbook_portfolio_header_has_no_quantity(tmp_path):

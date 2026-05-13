@@ -25,9 +25,12 @@ from stocks_report import (
     CURRENCIES_SHEET_NAME,
     FX_PAIRS,
     MARKET_COLUMNS,
-    MONTHLY_MOVERS_SHEET_NAME,
+    MONTHLY_LOSERS_SHEET_NAME,
+    MONTHLY_MOVERS_LEGACY_NAME,
+    MONTHLY_WINNERS_SHEET_NAME,
     _ensure_currencies_sheet_xlwings,
-    _ensure_monthly_movers_sheet_xlwings,
+    _ensure_ranking_sheet_xlwings,
+    _migrate_monthly_movers_to_winners_xlwings,
     _xw_last_visible_sheet,
     _xw_reapply_market_autofilter,
     init_workbook,
@@ -142,26 +145,47 @@ def test_ensure_currencies_sheet_is_idempotent(workbook_with_hidden_trailing_she
     assert len(matches) == 1
 
 
-def test_ensure_monthly_movers_sheet_succeeds_with_hidden_trailing(workbook_with_hidden_trailing_sheet):
-    """Same bug class as Currencies — Monthly movers was a latent victim."""
+def test_ensure_ranking_sheet_winners_succeeds_with_hidden_trailing(workbook_with_hidden_trailing_sheet):
+    """Same bug class as Currencies — used to fail because sheets.add(after=
+    very_hidden_sheet) raised Move-method-failed."""
     wb = workbook_with_hidden_trailing_sheet
-    _ensure_monthly_movers_sheet_xlwings(wb, movers=[])  # empty input is fine
-    assert MONTHLY_MOVERS_SHEET_NAME in [s.name for s in wb.sheets]
+    _ensure_ranking_sheet_xlwings(wb, MONTHLY_WINNERS_SHEET_NAME, rows=[])
+    assert MONTHLY_WINNERS_SHEET_NAME in [s.name for s in wb.sheets]
 
 
-def test_ensure_monthly_movers_sheet_writes_rows(workbook_with_hidden_trailing_sheet):
+def test_ensure_ranking_sheet_losers_succeeds_with_hidden_trailing(workbook_with_hidden_trailing_sheet):
     wb = workbook_with_hidden_trailing_sheet
-    movers = [
-        {"symbol": "AAPL", "name": "Apple", "indexes": "SP500", "sector": "Technology",
+    _ensure_ranking_sheet_xlwings(wb, MONTHLY_LOSERS_SHEET_NAME, rows=[], filter_owned_yes=True)
+    assert MONTHLY_LOSERS_SHEET_NAME in [s.name for s in wb.sheets]
+
+
+def test_ensure_ranking_sheet_writes_rows_with_owned_column(workbook_with_hidden_trailing_sheet):
+    """Sheet gets the 9-col header including Owned? at col C."""
+    wb = workbook_with_hidden_trailing_sheet
+    rows = [
+        {"symbol": "AAPL", "name": "Apple", "owned": "Yes", "indexes": "SP500", "sector": "Tech",
          "today": 200.0, "pct_1d": 0.01, "pct_1w": 0.03, "pct_1m": 0.10},
-        {"symbol": "MSFT", "name": "Microsoft", "indexes": "SP500", "sector": "Technology",
+        {"symbol": "MSFT", "name": "Microsoft", "owned": "No", "indexes": "SP500", "sector": "Tech",
          "today": 400.0, "pct_1d": 0.005, "pct_1w": 0.02, "pct_1m": 0.08},
     ]
-    _ensure_monthly_movers_sheet_xlwings(wb, movers=movers)
-    sheet = wb.sheets[MONTHLY_MOVERS_SHEET_NAME]
-    # Header at row 1, two data rows
+    _ensure_ranking_sheet_xlwings(wb, MONTHLY_WINNERS_SHEET_NAME, rows=rows)
+    sheet = wb.sheets[MONTHLY_WINNERS_SHEET_NAME]
     assert sheet.range("A2").value == "AAPL"
-    assert sheet.range("A3").value == "MSFT"
+    assert sheet.range("C2").value == "Yes"   # Owned? column
+    assert sheet.range("C3").value == "No"
+
+
+def test_migrate_monthly_movers_xlwings_renames(workbook_with_hidden_trailing_sheet):
+    """The xlwings migration helper renames an existing 'Monthly movers'
+    sheet without affecting its content."""
+    wb = workbook_with_hidden_trailing_sheet
+    legacy = wb.sheets.add(MONTHLY_MOVERS_LEGACY_NAME)
+    legacy.range("A1").value = "preserve me"
+    _migrate_monthly_movers_to_winners_xlwings(wb)
+    names = [s.name for s in wb.sheets]
+    assert MONTHLY_MOVERS_LEGACY_NAME not in names
+    assert MONTHLY_WINNERS_SHEET_NAME in names
+    assert wb.sheets[MONTHLY_WINNERS_SHEET_NAME].range("A1").value == "preserve me"
 
 
 # ---------------------------------------------------------------------------

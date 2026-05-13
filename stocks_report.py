@@ -873,7 +873,7 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 # the data contract. The filename embeds this so the user can see at a glance
 # which generation of the script their workbook matches; the Help sheet renders
 # the changelog entries from VERSION_HISTORY below.
-SCHEMA_VERSION = "v02"
+SCHEMA_VERSION = "v03"
 
 # Append-only changelog. init-workbook appends any missing versions to the
 # Help sheet without touching user edits. Date is when the version was minted.
@@ -888,6 +888,15 @@ VERSION_HISTORY: list[tuple[str, str, str]] = [
      "each lookback. New Monthly movers sheet ranking the biggest 1M gainers "
      "that have NOT weakened over 1D or 1W. CHF added to FX_PAIRS. Market "
      "AutoFilter is re-applied to the new data extent on rebuild."),
+    ("v03", "2026-05-13",
+     "Renamed Monthly movers → Monthly winners. New Monthly losers sheet "
+     "(stocks with sustained 1M decline, also negative on 1D and 1W). Both "
+     "ranking sheets gain an Owned? column. Ranking is now computed from the "
+     "full Market sheet on every get_quotes — previously test mode left it "
+     "empty because only the refreshed row was considered. AutoFilter is "
+     "now on Monthly winners + Monthly losers; the Losers sheet has the "
+     "Owned?=Yes filter pre-selected. Existing 'Monthly movers' sheets are "
+     "auto-renamed on next init-workbook or get-quotes."),
 ]
 
 DEFAULT_WORKBOOK_PATH = Path(f"stocks_picker_{SCHEMA_VERSION}.xlsm")
@@ -903,7 +912,9 @@ ERROR_LOG_FILENAME = "stocks_errors.log"
 ERRORS_SHEET_NAME = "Errors"
 HELP_SHEET_NAME = "Help"
 CURRENCIES_SHEET_NAME = "Currencies"
-MONTHLY_MOVERS_SHEET_NAME = "Monthly movers"
+MONTHLY_WINNERS_SHEET_NAME = "Monthly winners"   # renamed from "Monthly movers" in v03
+MONTHLY_LOSERS_SHEET_NAME = "Monthly losers"
+MONTHLY_MOVERS_LEGACY_NAME = "Monthly movers"    # migrated from any existing workbook
 
 
 def _append_error_log(log_path: Path, exc_type: str, message: str, traceback_text: str) -> None:
@@ -1217,6 +1228,9 @@ def init_workbook(path: Path) -> Path:
 
     _layout_main_sheet(main_ws, overwrite=overwrite)
     _layout_market_sheet(market_ws, overwrite=overwrite)
+
+    # Auto-rename any legacy "Monthly movers" sheet to "Monthly winners".
+    _migrate_monthly_movers_to_winners_openpyxl(wb)
 
     # Ensure the Help sheet exists and contains a row for every entry in
     # VERSION_HISTORY. Append-only — never modifies rows the user has edited.
@@ -1785,8 +1799,7 @@ def button_get_quotes() -> None:
 
         ok = 0
         fail = 0
-        movers_input: list[dict] = []
-        for (row_idx, sym, ccy, indexes_csv) in targets:
+        for (row_idx, sym, ccy, _indexes_csv) in targets:
             try:
                 series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
                 eur_by_label = {}
@@ -1797,10 +1810,8 @@ def button_get_quotes() -> None:
                     eur_by_label[label] = eur
                     market.range((row_idx, cols[f"{label} (EUR)"])).value = eur
                 today_eur = eur_by_label.get("Today")
-                pct_by_short = {}
                 for past_label, pct_col in _pct_column_pairs():
                     pct = _pct_change(today_eur, eur_by_label.get(past_label))
-                    pct_by_short[pct_col] = pct
                     rng = market.range((row_idx, cols[pct_col]))
                     rng.value = pct
                     rng.api.NumberFormat = PERCENT_STYLE
@@ -1810,25 +1821,21 @@ def button_get_quotes() -> None:
                 market.range((row_idx, cols["Last update (UTC)"])).value = now_iso
                 market.range((row_idx, cols["Last error"])).value = None
                 ok += 1
-
-                movers_input.append({
-                    "symbol":  sym,
-                    "name":    market.range((row_idx, cols["Name"])).value,
-                    "indexes": indexes_csv,
-                    "sector":  market.range((row_idx, cols["Sector"])).value,
-                    "today":   today_eur,
-                    "pct_1d":  pct_by_short.get("1D %"),
-                    "pct_1w":  pct_by_short.get("1W %"),
-                    "pct_1m":  pct_by_short.get("1M %"),
-                })
             except Exception as e:
                 market.range((row_idx, cols["Last error"])).value = f"{type(e).__name__}: {e}"[:300]
                 fail += 1
 
-        # Monthly movers — rank and write after the per-row loop.
-        movers = _compute_monthly_movers(movers_input)
-        status(f"Monthly movers: {len(movers)} of {len(movers_input)} qualify")
-        _ensure_monthly_movers_sheet_xlwings(wb, movers)
+        # Migrate legacy "Monthly movers" → "Monthly winners" if needed; rank
+        # from the full Market sheet so test mode (1 refreshed ticker) still
+        # shows meaningful winners/losers.
+        _migrate_monthly_movers_to_winners_xlwings(wb)
+        status("Computing Monthly winners + losers")
+        all_records = _read_market_records_xlwings(market)
+        winners = _compute_monthly_winners(all_records)
+        losers  = _compute_monthly_losers(all_records)
+        status(f"Winners: {len(winners)}, Losers: {len(losers)} (of {len(all_records)} Market rows)")
+        _ensure_ranking_sheet_xlwings(wb, MONTHLY_WINNERS_SHEET_NAME, winners)
+        _ensure_ranking_sheet_xlwings(wb, MONTHLY_LOSERS_SHEET_NAME, losers, filter_owned_yes=True)
 
         main.range(MAIN_CELLS["LastQuotesAt"]).value = now_iso
         if not test_mode:
@@ -1931,41 +1938,89 @@ def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) ->
 
 
 # ---------------------------------------------------------------------------
-# Monthly movers sheet — top 1M gainers with no 1D/1W weakness
+# Monthly winners + Monthly losers sheets
 # ---------------------------------------------------------------------------
+#
+# Same 9-column layout, same input record schema, different filter+sort rules.
+# Computed from a snapshot of the FULL Market sheet on every get_quotes
+# (not just the rows refreshed this run), so test-mode get_quotes (which
+# only refreshes 1 ticker) still produces a meaningful ranking from the
+# rest of the existing data.
 
-MOVERS_HEADERS = ["Symbol", "Name", "Indexes", "Sector",
-                  "Today (EUR)", "1D %", "1W %", "1M %"]
-MONTHLY_MOVERS_TOP_N = 50
+RANKING_HEADERS = ["Symbol", "Name", "Owned?", "Indexes", "Sector",
+                   "Today (EUR)", "1D %", "1W %", "1M %"]
+MONTHLY_RANKING_TOP_N = 50
+OWNED_COL_INDEX_1BASED = RANKING_HEADERS.index("Owned?") + 1  # 3
 
 
-def _compute_monthly_movers(records: list[dict], top_n: int = MONTHLY_MOVERS_TOP_N) -> list[dict]:
-    """Filter to rows whose 1D %, 1W %, AND 1M % are all strictly positive,
-    then sort by 1M % descending and return the top N.
+def _compute_monthly_winners(records: list[dict],
+                              top_n: int = MONTHLY_RANKING_TOP_N) -> list[dict]:
+    """Top 1M gainers with NO 1D or 1W weakness.
 
-    Records are dicts with keys: symbol, name, indexes, sector, today,
-    pct_1d, pct_1w, pct_1m.
+    Filter: pct_1m > 0 AND pct_1d >= 0 AND pct_1w >= 0.
+    Sort: pct_1m descending.
     """
-    candidates = [
-        r for r in records
-        if (r.get("pct_1d") is not None and r["pct_1d"] > 0
-            and r.get("pct_1w") is not None and r["pct_1w"] > 0
-            and r.get("pct_1m") is not None and r["pct_1m"] > 0)
+    qualified: list[dict] = []
+    for r in records:
+        d, w, m = r.get("pct_1d"), r.get("pct_1w"), r.get("pct_1m")
+        if d is None or w is None or m is None:
+            continue
+        if m > 0 and d >= 0 and w >= 0:
+            qualified.append(r)
+    qualified.sort(key=lambda r: r["pct_1m"], reverse=True)
+    return qualified[:top_n]
+
+
+def _compute_monthly_losers(records: list[dict],
+                             top_n: int = MONTHLY_RANKING_TOP_N) -> list[dict]:
+    """Worst sustained 1M decliners — also negative on 1D and 1W.
+
+    Filter: pct_1m < 0 AND pct_1d <= 0 AND pct_1w <= 0.  (Mirrors the
+    winners' "no weakness" logic: we want sustained slides, not bounces.)
+    Sort: pct_1m ascending (most negative first).
+    """
+    qualified: list[dict] = []
+    for r in records:
+        d, w, m = r.get("pct_1d"), r.get("pct_1w"), r.get("pct_1m")
+        if d is None or w is None or m is None:
+            continue
+        if m < 0 and d <= 0 and w <= 0:
+            qualified.append(r)
+    qualified.sort(key=lambda r: r["pct_1m"])
+    return qualified[:top_n]
+
+
+def _ranking_row_values(m: dict) -> list:
+    """One row of values matching RANKING_HEADERS order."""
+    return [
+        m["symbol"],
+        m.get("name") or "",
+        m.get("owned") or "No",
+        m.get("indexes") or "",
+        m.get("sector") or "",
+        m.get("today"),
+        m.get("pct_1d"),
+        m.get("pct_1w"),
+        m.get("pct_1m"),
     ]
-    candidates.sort(key=lambda r: r["pct_1m"], reverse=True)
-    return candidates[:top_n]
 
 
-def _ensure_monthly_movers_sheet_openpyxl(wb, movers: list[dict]) -> None:
-    """Write/refresh the Monthly movers sheet via openpyxl (CLI path)."""
-    if MONTHLY_MOVERS_SHEET_NAME not in wb.sheetnames:
-        ws = wb.create_sheet(MONTHLY_MOVERS_SHEET_NAME)
+def _ensure_ranking_sheet_openpyxl(wb, sheet_name: str, rows: list[dict],
+                                    *, filter_owned_yes: bool = False) -> None:
+    """Write/refresh a winners-style sheet via openpyxl (CLI path).
+
+    ``filter_owned_yes`` toggles a pre-applied AutoFilter on Owned?=Yes,
+    used for the Monthly losers sheet so the user immediately sees decline
+    on stocks they own.
+    """
+    if sheet_name not in wb.sheetnames:
+        ws = wb.create_sheet(sheet_name)
         is_new = True
     else:
-        ws = wb[MONTHLY_MOVERS_SHEET_NAME]
+        ws = wb[sheet_name]
         is_new = False
 
-    for col_idx, name in enumerate(MOVERS_HEADERS, 1):
+    for col_idx, name in enumerate(RANKING_HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx)
         if is_new or cell.value != name:
             cell.value = name
@@ -1974,75 +2029,180 @@ def _ensure_monthly_movers_sheet_openpyxl(wb, movers: list[dict]) -> None:
             cell.fill = PatternFill("solid", fgColor="F2F2F2")
     if is_new:
         ws.freeze_panes = "A2"
-        widths = {"Symbol": 10, "Name": 28, "Indexes": 18, "Sector": 22,
-                  "Today (EUR)": 12, "1D %": 9, "1W %": 9, "1M %": 9}
-        for col_idx, name in enumerate(MOVERS_HEADERS, 1):
+        widths = {"Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18,
+                  "Sector": 22, "Today (EUR)": 12,
+                  "1D %": 9, "1W %": 9, "1M %": 9}
+        for col_idx, name in enumerate(RANKING_HEADERS, 1):
             ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
 
-    # Clear any prior data rows from a previous run, then write new ones.
+    # Clear prior data rows; write new ones.
     for r in range(2, ws.max_row + 1):
-        for c in range(1, len(MOVERS_HEADERS) + 1):
+        for c in range(1, len(RANKING_HEADERS) + 1):
             ws.cell(row=r, column=c).value = None
-    for r_offset, m in enumerate(movers, 0):
+    for r_offset, m in enumerate(rows, 0):
         row = 2 + r_offset
         sym = m["symbol"]
         sym_cell = ws.cell(row=row, column=1, value=sym)
         sym_cell.hyperlink = yahoo_quote_url(sym)
         sym_cell.style = "Hyperlink"
-        ws.cell(row=row, column=2, value=m.get("name") or "")
-        ws.cell(row=row, column=3, value=m.get("indexes") or "")
-        ws.cell(row=row, column=4, value=m.get("sector") or "")
-        c5 = ws.cell(row=row, column=5, value=m.get("today"))
-        c5.number_format = COMMA_STYLE
-        for pct_col_idx, key in ((6, "pct_1d"), (7, "pct_1w"), (8, "pct_1m")):
-            cell = ws.cell(row=row, column=pct_col_idx, value=m.get(key))
+        values = _ranking_row_values(m)
+        ws.cell(row=row, column=2, value=values[1])
+        ws.cell(row=row, column=3, value=values[2])
+        ws.cell(row=row, column=4, value=values[3])
+        ws.cell(row=row, column=5, value=values[4])
+        c6 = ws.cell(row=row, column=6, value=values[5])
+        c6.number_format = COMMA_STYLE
+        for pct_col_idx, val in ((7, values[6]), (8, values[7]), (9, values[8])):
+            cell = ws.cell(row=row, column=pct_col_idx, value=val)
             cell.number_format = PERCENT_STYLE
 
+    # AutoFilter on the data range, with optional pre-set Owned?=Yes filter.
+    last_col_letter = get_column_letter(len(RANKING_HEADERS))
+    last_row = 1 + len(rows) if rows else 1
+    ws.auto_filter.ref = f"A1:{last_col_letter}{last_row}"
+    # Clear any prior filterColumn objects
+    ws.auto_filter.filterColumn = []
+    if filter_owned_yes and rows:
+        from openpyxl.worksheet.filters import FilterColumn, Filters
+        fc = FilterColumn(colId=OWNED_COL_INDEX_1BASED - 1)  # 0-based for FilterColumn
+        fc.filters = Filters(filter=["Yes"])
+        ws.auto_filter.filterColumn.append(fc)
 
-def _ensure_monthly_movers_sheet_xlwings(wb_xw, movers: list[dict]) -> None:
-    """Write/refresh the Monthly movers sheet via xlwings (button path)."""
+
+def _ensure_ranking_sheet_xlwings(wb_xw, sheet_name: str, rows: list[dict],
+                                   *, filter_owned_yes: bool = False) -> None:
+    """Write/refresh a winners-style sheet via xlwings (button path)."""
     sheet_names = [s.name for s in wb_xw.sheets]
-    if MONTHLY_MOVERS_SHEET_NAME not in sheet_names:
-        mv = wb_xw.sheets.add(MONTHLY_MOVERS_SHEET_NAME, after=_xw_last_visible_sheet(wb_xw))
+    if sheet_name not in sheet_names:
+        sh = wb_xw.sheets.add(sheet_name, after=_xw_last_visible_sheet(wb_xw))
         is_new = True
     else:
-        mv = wb_xw.sheets[MONTHLY_MOVERS_SHEET_NAME]
+        sh = wb_xw.sheets[sheet_name]
         is_new = False
 
-    mv.range("A1").value = [MOVERS_HEADERS]
+    sh.range("A1").value = [RANKING_HEADERS]
     if is_new:
-        mv.range(f"A1:{get_column_letter(len(MOVERS_HEADERS))}1").api.Font.Bold = True
+        sh.range(f"A1:{get_column_letter(len(RANKING_HEADERS))}1").api.Font.Bold = True
 
-    # Wipe prior data rows + write new ones in one bulk write.
-    last_row_now = mv.used_range.last_cell.row
+    last_row_now = sh.used_range.last_cell.row
     if last_row_now >= 2:
-        mv.range(f"A2:{get_column_letter(len(MOVERS_HEADERS))}{last_row_now}").clear()
+        sh.range(f"A2:{get_column_letter(len(RANKING_HEADERS))}{last_row_now}").clear()
 
-    if movers:
-        rows = []
-        for m in movers:
-            rows.append([
-                m["symbol"],
-                m.get("name") or "",
-                m.get("indexes") or "",
-                m.get("sector") or "",
-                m.get("today"),
-                m.get("pct_1d"),
-                m.get("pct_1w"),
-                m.get("pct_1m"),
-            ])
-        mv.range((2, 1)).value = rows
+    if rows:
+        bulk = [_ranking_row_values(m) for m in rows]
+        sh.range((2, 1)).value = bulk
         last_row = 1 + len(rows)
-        mv.range(f"E2:E{last_row}").api.NumberFormat = COMMA_STYLE
-        mv.range(f"F2:H{last_row}").api.NumberFormat = PERCENT_STYLE
-        # Hyperlink each symbol cell
-        for offset, m in enumerate(movers):
-            cell = mv.range((2 + offset, 1))
-            mv.api.Hyperlinks.Add(
+        sh.range(f"F2:F{last_row}").api.NumberFormat = COMMA_STYLE
+        sh.range(f"G2:I{last_row}").api.NumberFormat = PERCENT_STYLE
+        # Hyperlink each Symbol cell
+        for offset, m in enumerate(rows):
+            cell = sh.range((2 + offset, 1))
+            sh.api.Hyperlinks.Add(
                 Anchor=cell.api,
                 Address=yahoo_quote_url(m["symbol"]),
                 TextToDisplay=m["symbol"],
             )
+
+        # AutoFilter (best-effort via the same helper Market uses).
+        last_col_letter = get_column_letter(len(RANKING_HEADERS))
+        try:
+            if sh.api.AutoFilterMode:
+                sh.api.AutoFilterMode = False
+            app = wb_xw.app
+            prev_screen = app.api.ScreenUpdating
+            prev_sheet = wb_xw.api.ActiveSheet
+            app.api.ScreenUpdating = False
+            try:
+                sh.api.Activate()
+                if filter_owned_yes:
+                    sh.api.Range(f"A1:{last_col_letter}{last_row}").AutoFilter(
+                        Field=OWNED_COL_INDEX_1BASED, Criteria1="Yes",
+                    )
+                else:
+                    sh.api.Range(f"A1:{last_col_letter}{last_row}").AutoFilter()
+            finally:
+                try:
+                    prev_sheet.Activate()
+                except Exception:
+                    pass
+                app.api.ScreenUpdating = prev_screen
+        except Exception as e:
+            log.warning(f"Couldn't apply AutoFilter on {sheet_name}: {e}")
+            try:
+                sh.api.AutoFilterMode = False
+            except Exception:
+                pass
+
+
+def _read_market_records_openpyxl(market_ws) -> list[dict]:
+    """Snapshot every Market data row into the shape _compute_monthly_*
+    expects. Used by get_quotes so the ranking sees the whole market,
+    not just the rows we refreshed this run."""
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+    out: list[dict] = []
+    for r in range(2, market_ws.max_row + 1):
+        sym = market_ws.cell(row=r, column=cols["Symbol"]).value
+        if not sym:
+            continue
+        out.append({
+            "symbol":  str(sym),
+            "name":    market_ws.cell(row=r, column=cols["Name"]).value,
+            "owned":   market_ws.cell(row=r, column=cols["Owned?"]).value,
+            "indexes": market_ws.cell(row=r, column=cols["Indexes"]).value,
+            "sector":  market_ws.cell(row=r, column=cols["Sector"]).value,
+            "today":   market_ws.cell(row=r, column=cols["Today (EUR)"]).value,
+            "pct_1d":  market_ws.cell(row=r, column=cols["1D %"]).value,
+            "pct_1w":  market_ws.cell(row=r, column=cols["1W %"]).value,
+            "pct_1m":  market_ws.cell(row=r, column=cols["1M %"]).value,
+        })
+    return out
+
+
+def _read_market_records_xlwings(market_xw) -> list[dict]:
+    """Same as the openpyxl version but bulk-reads via xlwings COM."""
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+    last_row = market_xw.used_range.last_cell.row
+    if last_row < 2:
+        return []
+    last_col = len(MARKET_COLUMNS)
+    last_col_letter = get_column_letter(last_col)
+    # Bulk read — one COM call instead of N×M cell reads.
+    matrix = market_xw.range(f"A2:{last_col_letter}{last_row}").value
+    # Single row → xlwings returns a flat list; normalize to list-of-lists.
+    if matrix and not isinstance(matrix[0], list):
+        matrix = [matrix]
+    out: list[dict] = []
+    for row_vals in matrix:
+        sym = row_vals[cols["Symbol"] - 1]
+        if not sym:
+            continue
+        out.append({
+            "symbol":  str(sym),
+            "name":    row_vals[cols["Name"] - 1],
+            "owned":   row_vals[cols["Owned?"] - 1],
+            "indexes": row_vals[cols["Indexes"] - 1],
+            "sector":  row_vals[cols["Sector"] - 1],
+            "today":   row_vals[cols["Today (EUR)"] - 1],
+            "pct_1d":  row_vals[cols["1D %"] - 1],
+            "pct_1w":  row_vals[cols["1W %"] - 1],
+            "pct_1m":  row_vals[cols["1M %"] - 1],
+        })
+    return out
+
+
+def _migrate_monthly_movers_to_winners_openpyxl(wb) -> None:
+    """If the workbook still has a legacy 'Monthly movers' sheet, rename it."""
+    if MONTHLY_MOVERS_LEGACY_NAME in wb.sheetnames and MONTHLY_WINNERS_SHEET_NAME not in wb.sheetnames:
+        wb[MONTHLY_MOVERS_LEGACY_NAME].title = MONTHLY_WINNERS_SHEET_NAME
+        log.info(f"  migrated sheet '{MONTHLY_MOVERS_LEGACY_NAME}' → '{MONTHLY_WINNERS_SHEET_NAME}'")
+
+
+def _migrate_monthly_movers_to_winners_xlwings(wb_xw) -> None:
+    """xlwings counterpart of the migration."""
+    names = [s.name for s in wb_xw.sheets]
+    if MONTHLY_MOVERS_LEGACY_NAME in names and MONTHLY_WINNERS_SHEET_NAME not in names:
+        wb_xw.sheets[MONTHLY_MOVERS_LEGACY_NAME].name = MONTHLY_WINNERS_SHEET_NAME
+        log.info(f"  migrated sheet '{MONTHLY_MOVERS_LEGACY_NAME}' → '{MONTHLY_WINNERS_SHEET_NAME}'")
 
 
 # ---------------------------------------------------------------------------
@@ -2161,7 +2321,6 @@ def get_quotes(
 
     successes = 0
     failures = 0
-    movers_input: list[dict] = []
     for (row_idx, sym, ccy, indexes_csv) in targets:
         try:
             series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
@@ -2174,10 +2333,8 @@ def get_quotes(
                 market_ws.cell(row=row_idx, column=cols[f"{label} (EUR)"], value=eur)
             # % change vs Today for each non-Today lookback
             today_eur = eur_by_label.get("Today")
-            pct_by_short: dict[str, Optional[float]] = {}
             for past_label, pct_col in _pct_column_pairs():
                 pct = _pct_change(today_eur, eur_by_label.get(past_label))
-                pct_by_short[pct_col] = pct
                 cell = market_ws.cell(row=row_idx, column=cols[pct_col], value=pct)
                 cell.number_format = PERCENT_STYLE
             info = info_map.get(sym, {})
@@ -2186,28 +2343,21 @@ def get_quotes(
             market_ws.cell(row=row_idx, column=cols["Last update (UTC)"], value=now_iso)
             market_ws.cell(row=row_idx, column=cols["Last error"], value=None)  # clear previous
             successes += 1
-
-            # Capture for Monthly movers ranking. Read Name + Sector from the
-            # sheet (rebuild_inventory wrote them; we don't have them in scope).
-            movers_input.append({
-                "symbol":  sym,
-                "name":    market_ws.cell(row=row_idx, column=cols["Name"]).value,
-                "indexes": indexes_csv,
-                "sector":  market_ws.cell(row=row_idx, column=cols["Sector"]).value,
-                "today":   today_eur,
-                "pct_1d":  pct_by_short.get("1D %"),
-                "pct_1w":  pct_by_short.get("1W %"),
-                "pct_1m":  pct_by_short.get("1M %"),
-            })
         except Exception as e:
             market_ws.cell(row=row_idx, column=cols["Last error"], value=f"{type(e).__name__}: {e}"[:300])
             failures += 1
             log.warning(f"  {sym}: {e}")
 
-    # After the per-row loop: rank movers and write the sheet.
-    movers = _compute_monthly_movers(movers_input)
-    _say(f"Monthly movers: {len(movers)} of {len(movers_input)} qualify (1D/1W/1M all positive)")
-    _ensure_monthly_movers_sheet_openpyxl(wb, movers)
+    # Migrate legacy "Monthly movers" sheet name if present, then compute
+    # winners + losers from the FULL Market (not just refreshed targets) so
+    # test mode with 1 refreshed ticker still shows a meaningful ranking.
+    _migrate_monthly_movers_to_winners_openpyxl(wb)
+    all_records = _read_market_records_openpyxl(market_ws)
+    winners = _compute_monthly_winners(all_records)
+    losers  = _compute_monthly_losers(all_records)
+    _say(f"Monthly winners: {len(winners)} qualify; losers: {len(losers)} (out of {len(all_records)} Market rows)")
+    _ensure_ranking_sheet_openpyxl(wb, MONTHLY_WINNERS_SHEET_NAME, winners)
+    _ensure_ranking_sheet_openpyxl(wb, MONTHLY_LOSERS_SHEET_NAME, losers, filter_owned_yes=True)
 
     # Update Main metadata
     main_ws[MAIN_CELLS["LastQuotesAt"]] = now_iso
