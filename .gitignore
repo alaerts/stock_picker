@@ -18,6 +18,10 @@ stocks_report_*.xlsx
 # Run logs
 *.log
 
+# Speedup F: yfinance .info SQLite cache (lives next to the workbook)
+stocks_info_cache.sqlite
+stocks_info_cache.sqlite-journal
+
 # Binary deliverable snapshots
 *.zip
 

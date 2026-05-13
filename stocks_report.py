@@ -46,8 +46,10 @@ import datetime as dt
 import io
 import logging
 import re
+import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -671,43 +673,204 @@ def fetch_ticker_info(ticker: str) -> dict:
         "description": info.get("longBusinessSummary") or "",
     }
 
-def fetch_all_info(tickers: list[str], delay: float = 0.25,
+def fetch_all_info(tickers: list[str], delay: float = 0.0,
                    progress: Optional[Callable[[int, int, str], None]] = None,
                    should_stop: Optional[Callable[[], bool]] = None,
-                   stop_poll_every: int = 25) -> dict[str, dict]:
-    """Fetch yfinance .info for each ticker.
+                   stop_poll_every: int = 25,
+                   max_workers: int = 12) -> dict[str, dict]:
+    """Fetch yfinance .info for each ticker, in parallel.
+
+    Speedup A: uses ``ThreadPoolExecutor`` with ``max_workers`` concurrent
+    workers. yfinance .info is HTTP-bound so threads parallelize well — a
+    ~1000-ticker run that took ~4 min sequential drops to ~30–60s.
+
+    The ``delay`` arg is kept for backward compatibility with tests but is
+    no longer applied between requests; the concurrency cap is the new
+    rate-limiter.
 
     Optional callbacks:
-      - ``progress(done, total, current_symbol)`` invoked before each fetch —
-        used by rebuild_inventory to push live ticker count into the workbook's
-        Status cell.
-      - ``should_stop()`` polled every ``stop_poll_every`` tickers — when it
-        returns True the loop breaks early, returning whatever has been
-        gathered so far. The caller is responsible for any partial-state
-        handling. This is the cell-based STOP path: the user toggles the
-        STOP checkbox on Main and Python sees it on the next poll.
+      - ``progress(done, total, current_symbol)`` invoked as each ticker
+        *completes* (not in submit order). Fires from the main thread.
+      - ``should_stop()`` polled every ``stop_poll_every`` completions —
+        when it returns True, pending futures are cancelled and the
+        function returns the partial dict gathered so far. Caller can
+        detect this via ``len(out) < len(tickers)``.
     """
-    log.info(f"Fetching .info for {len(tickers)} tickers (delay={delay}s)")
+    del delay  # kept in signature for callers/tests; no longer used
+    total = len(tickers)
+    log.info(f"Fetching .info for {total} tickers (parallel, workers={max_workers})")
     out: dict[str, dict] = {}
-    for i, t in enumerate(tickers, 1):
-        if i % 50 == 0 or i == 1:
-            log.info(f"  info {i}/{len(tickers)}")
-        if should_stop is not None and (i == 1 or i % stop_poll_every == 0):
+    stopped = False
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_ticker = {ex.submit(fetch_ticker_info, t): t for t in tickers}
+        done = 0
+        for fut in as_completed(future_to_ticker):
+            t = future_to_ticker[fut]
             try:
-                if should_stop():
-                    log.info(f"  STOP requested at {i}/{len(tickers)} — breaking out of .info loop")
-                    break
+                out[t] = fut.result()
             except Exception as e:
-                log.debug(f"should_stop callback raised: {e}")
-        if progress is not None:
-            try:
-                progress(i, len(tickers), t)
-            except Exception as e:
-                log.debug(f"progress callback failed: {e}")
-        out[t] = fetch_ticker_info(t)
-        time.sleep(delay)
-    # Caller can detect "stop" via len(out) < len(tickers).
+                log.debug(f"info('{t}') raised in worker: {e}")
+                out[t] = {
+                    "currency": "", "trailingPE": None, "forwardPE": None,
+                    "longName": "", "sector": "", "description": "",
+                }
+            done += 1
+            if done % 50 == 0 or done == 1:
+                log.info(f"  info {done}/{total}")
+            if progress is not None:
+                try:
+                    progress(done, total, t)
+                except Exception as e:
+                    log.debug(f"progress callback failed: {e}")
+            if should_stop is not None and (done == 1 or done % stop_poll_every == 0):
+                try:
+                    if should_stop():
+                        log.info(f"  STOP requested at {done}/{total} — cancelling pending .info futures")
+                        stopped = True
+                        break
+                except Exception as e:
+                    log.debug(f"should_stop callback raised: {e}")
+        if stopped:
+            for f in future_to_ticker:
+                if not f.done():
+                    f.cancel()
     return out
+
+class InfoCache:
+    """Speedup F: persistent SQLite cache for yfinance .info results.
+
+    Used by rebuild_inventory to skip the slow per-ticker .info fetch when
+    we already have a recent result. The cached fields (currency, sector,
+    longName, description) change rarely; a 7-day TTL refreshes naturally
+    against renames or sector reclassifications without paying the full
+    multi-minute scan on every rebuild.
+
+    Not used by get_quotes — P/E moves daily and refreshing it is the
+    whole point of running get_quotes.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._conn = sqlite3.connect(str(self.path))
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS info_cache ("
+            "ticker TEXT PRIMARY KEY, currency TEXT, trailing_pe REAL, "
+            "forward_pe REAL, long_name TEXT, sector TEXT, description TEXT, "
+            "fetched_at REAL NOT NULL)"
+        )
+        self._conn.commit()
+
+    def get_fresh(self, tickers: list[str], ttl_seconds: float) -> dict[str, dict]:
+        if not tickers:
+            return {}
+        cutoff = time.time() - ttl_seconds
+        placeholders = ",".join("?" * len(tickers))
+        cur = self._conn.execute(
+            f"SELECT ticker, currency, trailing_pe, forward_pe, long_name, sector, description "
+            f"FROM info_cache WHERE fetched_at >= ? AND ticker IN ({placeholders})",
+            [cutoff, *tickers],
+        )
+        out: dict[str, dict] = {}
+        for t, ccy, tpe, fpe, ln, sec, desc in cur.fetchall():
+            out[t] = {
+                "currency": ccy or "",
+                "trailingPE": tpe,
+                "forwardPE": fpe,
+                "longName": ln or "",
+                "sector": sec or "",
+                "description": desc or "",
+            }
+        return out
+
+    def put_many(self, items: dict[str, dict]) -> None:
+        if not items:
+            return
+        now = time.time()
+        rows = [
+            (
+                t,
+                (d.get("currency") or ""),
+                d.get("trailingPE"),
+                d.get("forwardPE"),
+                (d.get("longName") or ""),
+                (d.get("sector") or ""),
+                (d.get("description") or ""),
+                now,
+            )
+            for t, d in items.items()
+        ]
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO info_cache (ticker, currency, trailing_pe, forward_pe, "
+            "long_name, sector, description, fetched_at) VALUES (?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+def fetch_all_info_with_cache(
+    tickers: list[str],
+    cache_path: Path,
+    ttl_seconds: Optional[float] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    max_workers: int = 12,
+) -> tuple[dict[str, dict], int]:
+    """Speedup F wrapper around ``fetch_all_info`` — returns ``(info_map, cached_count)``.
+
+    Cache hits short-circuit the .info network call; misses go to the
+    parallel fetcher. Fresh results are persisted back to the cache. The
+    progress callback fires only for the miss subset (the caller can
+    surface ``cached_count`` separately in status text).
+    """
+    if ttl_seconds is None:
+        ttl_seconds = INFO_CACHE_TTL_DAYS * 86400
+    cache = InfoCache(Path(cache_path))
+    try:
+        cached = cache.get_fresh(tickers, ttl_seconds)
+        misses = [t for t in tickers if t not in cached]
+        if misses:
+            fresh = fetch_all_info(
+                misses, progress=progress, should_stop=should_stop,
+                max_workers=max_workers,
+            )
+            cache.put_many(fresh)
+        else:
+            fresh = {}
+        return {**cached, **fresh}, len(cached)
+    finally:
+        cache.close()
+
+
+def _info_cache_path_for(workbook_path: Optional[Path]) -> Path:
+    """Pick the SQLite cache location next to the workbook (or cwd if unknown)."""
+    base = Path(workbook_path).parent if workbook_path else Path.cwd()
+    return base / INFO_CACHE_FILENAME
+
+
+def is_recently_updated(last_update_iso: Optional[str], threshold_hours: float,
+                        now: Optional[dt.datetime] = None) -> bool:
+    """Return True if ``last_update_iso`` is within ``threshold_hours`` of ``now``.
+
+    Accepts the ISO-Z form ``YYYY-MM-DDTHH:MM:SSZ`` that get_quotes writes
+    into Market!"Last update (UTC)". Returns False on empty / unparseable
+    input — i.e. a missing or malformed timestamp means "not fresh, refetch".
+    """
+    if not last_update_iso:
+        return False
+    try:
+        ts = dt.datetime.fromisoformat(str(last_update_iso).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.UTC)
+    now = now or dt.datetime.now(dt.UTC)
+    return (now - ts).total_seconds() < threshold_hours * 3600
 
 # ---------------------------------------------------------------------------
 # Price lookup
@@ -931,6 +1094,19 @@ TEST_MODE_TICKER_LIMIT = 5
 # 20 is a reasonable balance: ~5 sec for the .info loop, enough rows for
 # the ranking to find candidates even in a freshly-rebuilt Market.
 TEST_MODE_QUOTE_REFRESH_LIMIT = 20
+
+# Speedup C: if Market!"Last update (UTC)" is within this many hours, skip
+# the .info refresh for that ticker on the next get_quotes run. P/E + name
+# values from the prior run are kept in place. Prices are still refreshed
+# every run (cheap, batched). 4h is short enough that intraday re-runs
+# don't go stale and long enough to make a sub-hour re-run feel snappy.
+QUOTE_FRESHNESS_HOURS = 4.0
+
+# Speedup F: SQLite cache for slow-changing .info fields used by
+# rebuild_inventory (currency, sector, longName, description). P/E is
+# excluded — it changes daily and gets refreshed by get_quotes anyway.
+INFO_CACHE_FILENAME = "stocks_info_cache.sqlite"
+INFO_CACHE_TTL_DAYS = 7
 
 # Where button-triggered errors land. Lives next to the workbook so the user
 # can find it without leaving Excel.
@@ -1487,11 +1663,18 @@ def rebuild_inventory(
     if main_for_stop[MAIN_CELLS["StopRequested"]].value is not None:
         main_for_stop[MAIN_CELLS["StopRequested"]] = "FALSE"
 
-    info_map = fetch_all_info(
-        list(constituents["Symbol"]), delay=info_delay,
+    # Speedup F: use the SQLite info cache. 7-day TTL keeps slow-changing
+    # fields warm; only true misses pay the .info round-trip.
+    cache_path = _info_cache_path_for(workbook_path)
+    info_map, cache_hits = fetch_all_info_with_cache(
+        list(constituents["Symbol"]),
+        cache_path=cache_path,
         progress=info_progress,
         should_stop=lambda: read_stop_requested(wb["Main"]),
     )
+    if cache_hits:
+        _say(f"  .info cache hits: {cache_hits}/{len(constituents)} "
+             f"(fresh fetches: {len(constituents) - cache_hits})")
     if len(info_map) < len(constituents):
         _say(f"STOPPED at {len(info_map)}/{len(constituents)} tickers — Market not modified.")
         return 0
@@ -1790,11 +1973,18 @@ def button_rebuild_inventory() -> None:
             if done == 1 or done == total or done % 10 == 0:
                 status(f"info {done}/{total} — {sym}")
 
-        info_map = fetch_all_info(
+        # Speedup F: SQLite cache short-circuits repeat .info fetches.
+        wb_path = Path(wb.fullname) if wb.fullname else None
+        cache_path = _info_cache_path_for(wb_path)
+        info_map, cache_hits = fetch_all_info_with_cache(
             list(constituents["Symbol"]),
-            delay=0.25, progress=info_progress,
+            cache_path=cache_path,
+            progress=info_progress,
             should_stop=lambda: _xw_read_stop_requested(main),
         )
+        if cache_hits:
+            status(f"  .info cache hits: {cache_hits}/{len(constituents)} "
+                   f"(fresh: {len(constituents) - cache_hits})")
         # If the user clicked STOP mid-.info, bail before writing Market.
         # Partial structural data isn't useful — leave Market as it was.
         if len(info_map) < len(constituents):
@@ -1995,19 +2185,39 @@ def button_get_quotes() -> None:
         end   = today + dt.timedelta(days=1)
         closes = fetch_close_prices([t[1] for t in targets], start, end)
 
-        status(f"Fetching .info for {len(targets)} tickers (P/E)")
+        # Speedup C: filter out targets whose Last update is recent.
+        lu_col_xw = MARKET_COLUMNS.index("Last update (UTC)") + 1
+        stale_targets: list[tuple[int, str, str, str]] = []
+        fresh_count = 0
+        for row in targets:
+            last_iso = market.range((row[0], lu_col_xw)).value
+            if isinstance(last_iso, dt.datetime):
+                # xlwings may surface ISO timestamps as native datetimes
+                if last_iso.tzinfo is None:
+                    last_iso_for_check = last_iso.replace(tzinfo=dt.UTC).isoformat()
+                else:
+                    last_iso_for_check = last_iso.isoformat()
+            else:
+                last_iso_for_check = last_iso
+            if is_recently_updated(last_iso_for_check, QUOTE_FRESHNESS_HOURS):
+                fresh_count += 1
+            else:
+                stale_targets.append(row)
+        if fresh_count:
+            status(f"Skipping .info for {fresh_count} rows refreshed within {QUOTE_FRESHNESS_HOURS:g}h")
+        status(f"Fetching .info for {len(stale_targets)} tickers (P/E)")
 
         def info_progress(done: int, total: int, sym: str) -> None:
             if done == 1 or done == total or done % 10 == 0:
                 status(f"quotes {done}/{total} — {sym}")
 
         info_map = fetch_all_info(
-            [t[1] for t in targets], delay=0.25, progress=info_progress,
+            [t[1] for t in stale_targets], delay=0.25, progress=info_progress,
             should_stop=lambda: _xw_read_stop_requested(main),
         )
-        info_stopped = len(info_map) < len(targets)
+        info_stopped = len(info_map) < len(stale_targets)
         if info_stopped:
-            status(f"STOP detected — only {len(info_map)} of {len(targets)} .info fetches done; "
+            status(f"STOP detected — only {len(info_map)} of {len(stale_targets)} .info fetches done; "
                    "continuing to write rows we have")
 
         status(f"Writing quote columns for {len(targets)} rows…")
@@ -2036,10 +2246,12 @@ def button_get_quotes() -> None:
                     rng = market.range((row_idx, cols[pct_col]))
                     rng.value = pct
                     rng.api.NumberFormat = PERCENT_STYLE
-                info = info_map.get(sym, {})
-                market.range((row_idx, cols["P/E (TTM)"])).value   = info.get("trailingPE")
-                market.range((row_idx, cols["Forward P/E"])).value = info.get("forwardPE")
-                market.range((row_idx, cols["Last update (UTC)"])).value = now_iso
+                if sym in info_map:
+                    info = info_map[sym]
+                    market.range((row_idx, cols["P/E (TTM)"])).value   = info.get("trailingPE")
+                    market.range((row_idx, cols["Forward P/E"])).value = info.get("forwardPE")
+                    market.range((row_idx, cols["Last update (UTC)"])).value = now_iso
+                # else: skipped by freshness filter — keep prior P/E + Last update
                 market.range((row_idx, cols["Last error"])).value = None
                 ok += 1
             except Exception as e:
@@ -2589,7 +2801,22 @@ def get_quotes(
     end   = today + dt.timedelta(days=1)
     closes = fetch_close_prices([t[1] for t in targets], start, end)
 
-    _say(f"Fetching .info for {len(targets)} tickers (P/E)")
+    # Speedup C: skip .info for any row whose Last update is recent. We
+    # still refresh prices for every target (cheap, batched) — only the
+    # per-ticker .info call is dropped. P/E + Last update on skipped rows
+    # stays at its previous value.
+    lu_col = _market_col("Last update (UTC)")
+    stale_targets: list[tuple[int, str, str, str]] = []
+    fresh_count = 0
+    for row in targets:
+        last_iso = market_ws.cell(row=row[0], column=lu_col).value
+        if is_recently_updated(last_iso, QUOTE_FRESHNESS_HOURS):
+            fresh_count += 1
+        else:
+            stale_targets.append(row)
+    if fresh_count:
+        _say(f"Skipping .info for {fresh_count} rows refreshed within {QUOTE_FRESHNESS_HOURS:g}h")
+    _say(f"Fetching .info for {len(stale_targets)} tickers (P/E)")
 
     def info_progress(done: int, total: int, sym: str) -> None:
         if status is not None and (done == 1 or done == total or done % 25 == 0):
@@ -2600,7 +2827,7 @@ def get_quotes(
         main_ws[MAIN_CELLS["StopRequested"]] = "FALSE"
 
     info_map = fetch_all_info(
-        [t[1] for t in targets], delay=info_delay, progress=info_progress,
+        [t[1] for t in stale_targets], delay=info_delay, progress=info_progress,
         should_stop=lambda: read_stop_requested(main_ws),
     )
 
@@ -2629,10 +2856,12 @@ def get_quotes(
                 pct = _pct_change(today_eur, eur_by_label.get(past_label))
                 cell = market_ws.cell(row=row_idx, column=cols[pct_col], value=pct)
                 cell.number_format = PERCENT_STYLE
-            info = info_map.get(sym, {})
-            market_ws.cell(row=row_idx, column=cols["P/E (TTM)"],   value=info.get("trailingPE"))
-            market_ws.cell(row=row_idx, column=cols["Forward P/E"], value=info.get("forwardPE"))
-            market_ws.cell(row=row_idx, column=cols["Last update (UTC)"], value=now_iso)
+            if sym in info_map:
+                info = info_map[sym]
+                market_ws.cell(row=row_idx, column=cols["P/E (TTM)"],   value=info.get("trailingPE"))
+                market_ws.cell(row=row_idx, column=cols["Forward P/E"], value=info.get("forwardPE"))
+                market_ws.cell(row=row_idx, column=cols["Last update (UTC)"], value=now_iso)
+            # else: skipped by freshness filter — leave P/E + Last update at prior values
             market_ws.cell(row=row_idx, column=cols["Last error"], value=None)  # clear previous
             successes += 1
         except Exception as e:

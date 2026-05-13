@@ -1207,5 +1207,138 @@ def test_price_at_or_before_none_series():
     assert price_at_or_before(None, dt.date(2026, 5, 4)) is None
 
 
+# ---------------------------------------------------------------------------
+# Speedups A/C/F
+# ---------------------------------------------------------------------------
+
+def test_fetch_all_info_parallel_returns_all_results(monkeypatch):
+    """Speedup A: with ThreadPoolExecutor, every ticker still ends up in
+    the result dict regardless of completion order."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {"longName": t, "sector": "X"})
+    tickers = [f"T{i}" for i in range(75)]
+    out = sr.fetch_all_info(tickers, max_workers=8)
+    assert set(out.keys()) == set(tickers)
+    assert all(out[t]["longName"] == t for t in tickers)
+
+
+def test_fetch_all_info_progress_fires_per_completion(monkeypatch):
+    """Speedup A: progress callback fires for each completed ticker — used
+    by the workbook Status cell to show live counts."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {})
+    seen: list[int] = []
+    sr.fetch_all_info(
+        [f"T{i}" for i in range(20)],
+        progress=lambda done, total, sym: seen.append(done),
+        max_workers=4,
+    )
+    assert sorted(seen) == list(range(1, 21))
+
+
+def test_is_recently_updated_within_threshold():
+    """Speedup C: a fresh ISO timestamp is reported as recent."""
+    import stocks_report as sr
+    now = dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=dt.UTC)
+    iso = (now - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert sr.is_recently_updated(iso, threshold_hours=4.0, now=now) is True
+
+
+def test_is_recently_updated_outside_threshold():
+    import stocks_report as sr
+    now = dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=dt.UTC)
+    iso = (now - dt.timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert sr.is_recently_updated(iso, threshold_hours=4.0, now=now) is False
+
+
+def test_is_recently_updated_empty_or_garbage():
+    import stocks_report as sr
+    assert sr.is_recently_updated(None, 4.0) is False
+    assert sr.is_recently_updated("", 4.0) is False
+    assert sr.is_recently_updated("not-a-date", 4.0) is False
+
+
+def test_info_cache_roundtrip(tmp_path):
+    """Speedup F: put_many then get_fresh returns the same payload."""
+    import stocks_report as sr
+    cache = sr.InfoCache(tmp_path / "cache.sqlite")
+    try:
+        cache.put_many({
+            "AAPL": {"currency": "USD", "trailingPE": 30.0, "forwardPE": 25.0,
+                     "longName": "Apple Inc.", "sector": "Technology",
+                     "description": "Designs phones."},
+        })
+        got = cache.get_fresh(["AAPL", "MSFT"], ttl_seconds=86400)
+    finally:
+        cache.close()
+    assert "MSFT" not in got
+    assert got["AAPL"]["longName"] == "Apple Inc."
+    assert got["AAPL"]["trailingPE"] == 30.0
+
+
+def test_info_cache_respects_ttl(tmp_path):
+    """Speedup F: entries older than TTL are not returned."""
+    import stocks_report as sr
+    cache = sr.InfoCache(tmp_path / "cache.sqlite")
+    try:
+        cache.put_many({"OLD": {"currency": "EUR"}})
+        # TTL = 0 seconds means everything is stale.
+        got = cache.get_fresh(["OLD"], ttl_seconds=0)
+    finally:
+        cache.close()
+    assert got == {}
+
+
+def test_fetch_all_info_with_cache_uses_cache(tmp_path, monkeypatch):
+    """Speedup F: when cache covers a ticker, fetch_ticker_info is NOT called for it."""
+    import stocks_report as sr
+    # Pre-warm the cache for AAPL.
+    cache = sr.InfoCache(tmp_path / "cache.sqlite")
+    try:
+        cache.put_many({"AAPL": {"currency": "USD", "longName": "Apple Inc."}})
+    finally:
+        cache.close()
+    call_log: list[str] = []
+    def fake_fetch(t):
+        call_log.append(t)
+        return {"currency": "??", "longName": f"FRESH-{t}"}
+    monkeypatch.setattr(sr, "fetch_ticker_info", fake_fetch)
+    info_map, hits = sr.fetch_all_info_with_cache(
+        ["AAPL", "MSFT"], cache_path=tmp_path / "cache.sqlite",
+        ttl_seconds=86400, max_workers=2,
+    )
+    assert hits == 1
+    assert call_log == ["MSFT"], "AAPL must NOT trigger a fresh fetch"
+    assert info_map["AAPL"]["longName"] == "Apple Inc."
+    assert info_map["MSFT"]["longName"] == "FRESH-MSFT"
+
+
+def test_fetch_all_info_with_cache_persists_misses(tmp_path, monkeypatch):
+    """Speedup F: fresh fetches get persisted so the next call hits cache."""
+    import stocks_report as sr
+    monkeypatch.setattr(sr, "fetch_ticker_info",
+                        lambda t: {"longName": f"persisted-{t}"})
+    cache_path = tmp_path / "cache.sqlite"
+    sr.fetch_all_info_with_cache(["A", "B"], cache_path=cache_path, ttl_seconds=86400)
+    # Second call should be a 100% cache hit; fetch_ticker_info MUST NOT fire.
+    monkeypatch.setattr(sr, "fetch_ticker_info",
+                        lambda t: pytest.fail(f"unexpected fetch of {t}"))
+    info_map, hits = sr.fetch_all_info_with_cache(
+        ["A", "B"], cache_path=cache_path, ttl_seconds=86400,
+    )
+    assert hits == 2
+    assert info_map["A"]["longName"] == "persisted-A"
+    assert info_map["B"]["longName"] == "persisted-B"
+
+
+def test_info_cache_path_lives_next_to_workbook(tmp_path):
+    """Cache file lives in the workbook's directory, not cwd."""
+    import stocks_report as sr
+    wb = tmp_path / "deep" / "stocks_picker_v03.xlsm"
+    wb.parent.mkdir(parents=True)
+    assert sr._info_cache_path_for(wb).parent == wb.parent
+    assert sr._info_cache_path_for(None).is_absolute()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
