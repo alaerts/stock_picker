@@ -175,6 +175,66 @@ def test_ensure_ranking_sheet_writes_rows_with_owned_column(workbook_with_hidden
     assert sheet.range("C3").value == "No"
 
 
+def test_ranking_populated_when_market_has_data_post_test_rebuild(workbook_with_hidden_trailing_sheet):
+    """Regression for 2026-05-13: Monthly winners/losers were empty in test
+    mode because rebuild_inventory --test wiped Market down to 5 rows.
+
+    Verify the full ranking flow against a Market with seeded data: a row
+    with 1D/1W/1M all positive must end up in Monthly winners; a row with
+    all three negative must end up in Monthly losers. This is exactly the
+    contract that test mode needs to preserve.
+    """
+    from stocks_report import (
+        _compute_monthly_winners,
+        _compute_monthly_losers,
+        _ensure_ranking_sheet_xlwings,
+        _read_market_records_xlwings,
+        MONTHLY_WINNERS_SHEET_NAME,
+        MONTHLY_LOSERS_SHEET_NAME,
+    )
+    wb = workbook_with_hidden_trailing_sheet
+    market = wb.sheets["Market"]
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+
+    # Seed Market with 4 rows: 2 winners + 2 losers (one of each "owned").
+    seeds = [
+        {"sym": "WIN1", "name": "Winner One", "owned": "Yes", "1d": 0.02, "1w": 0.05, "1m": 0.15},
+        {"sym": "WIN2", "name": "Winner Two", "owned": "No",  "1d": 0.01, "1w": 0.02, "1m": 0.08},
+        {"sym": "LOSE1", "name": "Loser One", "owned": "Yes", "1d": -0.02, "1w": -0.04, "1m": -0.12},
+        {"sym": "LOSE2", "name": "Loser Two", "owned": "No",  "1d": -0.01, "1w": -0.03, "1m": -0.07},
+    ]
+    for r, seed in enumerate(seeds, 2):
+        market.range((r, cols["Symbol"])).value = seed["sym"]
+        market.range((r, cols["Name"])).value = seed["name"]
+        market.range((r, cols["Owned?"])).value = seed["owned"]
+        market.range((r, cols["Indexes"])).value = "TEST"
+        market.range((r, cols["Sector"])).value = "Test"
+        market.range((r, cols["Today (EUR)"])).value = 100.0
+        market.range((r, cols["1D %"])).value = seed["1d"]
+        market.range((r, cols["1W %"])).value = seed["1w"]
+        market.range((r, cols["1M %"])).value = seed["1m"]
+
+    # Run the ranking flow (this is what get_quotes does after its per-row loop).
+    records = _read_market_records_xlwings(market)
+    winners = _compute_monthly_winners(records)
+    losers = _compute_monthly_losers(records)
+
+    # Both should have entries
+    assert len(winners) >= 2, f"Expected winners populated, got {len(winners)}"
+    assert len(losers) >= 2, f"Expected losers populated, got {len(losers)}"
+    assert {w["symbol"] for w in winners} >= {"WIN1", "WIN2"}
+    assert {l["symbol"] for l in losers} >= {"LOSE1", "LOSE2"}
+
+    # Write the sheets and verify they're not empty
+    _ensure_ranking_sheet_xlwings(wb, MONTHLY_WINNERS_SHEET_NAME, winners)
+    _ensure_ranking_sheet_xlwings(wb, MONTHLY_LOSERS_SHEET_NAME, losers, filter_owned_yes=True)
+    win_sheet = wb.sheets[MONTHLY_WINNERS_SHEET_NAME]
+    los_sheet = wb.sheets[MONTHLY_LOSERS_SHEET_NAME]
+    # First data row of each sheet must be non-empty (A2 = symbol).
+    assert win_sheet.range("A2").value is not None
+    assert los_sheet.range("A2").value is not None
+
+
 def test_migrate_monthly_movers_xlwings_renames(workbook_with_hidden_trailing_sheet):
     """The xlwings migration helper renames an existing 'Monthly movers'
     sheet without affecting its content."""

@@ -1315,6 +1315,54 @@ def _ensure_help_sheet_versions(ws: Worksheet, *, fresh: bool) -> None:
 # company info) and overwrites the Market sheet in place. Quote columns are
 # left blank for get_quotes to fill.
 
+def _write_market_structural_row(
+    market_ws, row: int, c: pd.Series, info: dict,
+    wl_membership: dict, portfolio: set[str], cols: dict[str, int],
+) -> None:
+    """Write the structural (non-quote) columns for one Market data row.
+
+    Shared by the full-rebuild path (write to fresh rows 2..N+1) and the
+    test-mode incremental-update path (write to existing rows discovered by
+    Symbol lookup). Quote / Last update / Last error columns are intentionally
+    left alone — those belong to get_quotes.
+    """
+    sym = c["Symbol"]
+
+    # Watchlist membership: try sym + suffix-stripped root
+    sym_root = re.sub(r"\.[A-Z]{1,3}$", "", sym)
+    labels: list[str] = []
+    for key in {sym, sym_root}:
+        labels.extend(wl_membership.get(key, []))
+    seen: set[str] = set()
+    labels_dedup = [x for x in labels if not (x in seen or seen.add(x))]
+
+    first_index = c["Indexes"].split(",")[0].strip()
+    ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(first_index, "")
+
+    sym_cell = market_ws.cell(row=row, column=cols["Symbol"], value=sym)
+    sym_cell.hyperlink = yahoo_quote_url(sym)
+    sym_cell.style = "Hyperlink"
+    market_ws.cell(row=row, column=cols["Name"],        value=info.get("longName") or c["Name"])
+    market_ws.cell(row=row, column=cols["Owned?"],      value=_owned_for(sym, portfolio))
+    market_ws.cell(row=row, column=cols["Indexes"],     value=c["Indexes"])
+    market_ws.cell(row=row, column=cols["Sector"],      value=info.get("sector") or "")
+    market_ws.cell(row=row, column=cols["Watchlists"],  value=", ".join(labels_dedup))
+    market_ws.cell(row=row, column=cols["Currency"],    value=ccy)
+    desc_cell = market_ws.cell(row=row, column=cols["Description"], value=info.get("description") or "")
+    # Force wrap text OFF on the Description cell — Excel sometimes
+    # auto-wraps long strings and the resulting tall rows are jarring.
+    desc_cell.alignment = Alignment(wrap_text=False)
+    # Pre-format the quote/PE cells so when get_quotes writes a value
+    # it'll render with thousand separators and 2 decimals out of the box.
+    for fmt_col in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)", "1M ago (EUR)",
+                    "6M ago (EUR)", "1Y ago (EUR)", "5Y ago (EUR)",
+                    "P/E (TTM)", "Forward P/E"):
+        market_ws.cell(row=row, column=cols[fmt_col]).number_format = COMMA_STYLE
+    # Pre-format the % cells with the percent style.
+    for _past_label, pct_col in _pct_column_pairs():
+        market_ws.cell(row=row, column=cols[pct_col]).number_format = PERCENT_STYLE
+
+
 def rebuild_inventory(
     workbook_path: Path,
     indexes: Optional[list[str]] = None,
@@ -1385,72 +1433,72 @@ def rebuild_inventory(
     info_map = fetch_all_info(list(constituents["Symbol"]), delay=info_delay,
                               progress=info_progress)
 
-    _say("Writing Market sheet")
     market_ws = wb["Market"]
-    # Clear existing data rows (preserve row 1 headers).
-    if market_ws.max_row > 1:
-        market_ws.delete_rows(2, market_ws.max_row - 1)
-
-    sym_col = _market_col("Symbol")
     cols = {name: i + 1 for i, name in enumerate(MARKET_COLUMNS)}
 
-    for r_offset, (_, c) in enumerate(constituents.iterrows(), 0):
-        row = 2 + r_offset
-        sym = c["Symbol"]
-        info = info_map.get(sym, {})
-
-        # Watchlist membership: try sym + suffix-stripped root
-        sym_root = re.sub(r"\.[A-Z]{1,3}$", "", sym)
-        labels: list[str] = []
-        for key in {sym, sym_root}:
-            labels.extend(wl_membership.get(key, []))
-        seen = set()
-        labels_dedup = [x for x in labels if not (x in seen or seen.add(x))]
-
-        first_index = c["Indexes"].split(",")[0].strip()
-        ccy = info.get("currency") or INDEX_DEFAULT_CCY.get(first_index, "")
-
-        sym_cell = market_ws.cell(row=row, column=cols["Symbol"], value=sym)
-        sym_cell.hyperlink = yahoo_quote_url(sym)
-        sym_cell.style = "Hyperlink"
-        market_ws.cell(row=row, column=cols["Name"],        value=info.get("longName") or c["Name"])
-        market_ws.cell(row=row, column=cols["Owned?"],      value=_owned_for(sym, portfolio))
-        market_ws.cell(row=row, column=cols["Indexes"],     value=c["Indexes"])
-        market_ws.cell(row=row, column=cols["Sector"],      value=info.get("sector") or "")
-        market_ws.cell(row=row, column=cols["Watchlists"],  value=", ".join(labels_dedup))
-        market_ws.cell(row=row, column=cols["Currency"],    value=ccy)
-        desc_cell = market_ws.cell(row=row, column=cols["Description"], value=info.get("description") or "")
-        # Force wrap text OFF on the Description cell — Excel sometimes
-        # auto-wraps long strings and the resulting tall rows are jarring.
-        desc_cell.alignment = Alignment(wrap_text=False)
-        # Pre-format the quote/PE cells so when get_quotes writes a value
-        # it'll render with thousand separators and 2 decimals out of the box.
-        for fmt_col in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)", "1M ago (EUR)",
-                        "6M ago (EUR)", "1Y ago (EUR)", "5Y ago (EUR)",
-                        "P/E (TTM)", "Forward P/E"):
-            market_ws.cell(row=row, column=cols[fmt_col]).number_format = COMMA_STYLE
-        # Pre-format the % cells with the percent style.
-        for _past_label, pct_col in _pct_column_pairs():
-            market_ws.cell(row=row, column=cols[pct_col]).number_format = PERCENT_STYLE
+    if test_mode:
+        # Preserve Market — only update structural columns of rows that
+        # already match the test constituents by Symbol. Skip any test row
+        # that isn't already in Market (most likely Market hasn't had a
+        # full rebuild yet; user will see the warning). This keeps the
+        # ~983 rows of stale quote data intact so the post-loop ranking
+        # computation has something to rank.
+        _say("Test mode: updating matching Market rows (no destructive wipe)")
+        existing_by_sym = {}
+        for r in range(2, market_ws.max_row + 1):
+            v = market_ws.cell(row=r, column=cols["Symbol"]).value
+            if v:
+                existing_by_sym[str(v).strip().upper()] = r
+        updated, skipped = 0, 0
+        for _, c in constituents.iterrows():
+            sym = c["Symbol"]
+            row = existing_by_sym.get(sym.upper())
+            if row is None:
+                skipped += 1
+                continue
+            _write_market_structural_row(
+                market_ws, row, c, info_map.get(sym, {}),
+                wl_membership, portfolio, cols,
+            )
+            updated += 1
+        if skipped and not existing_by_sym:
+            _say("  warning: Market is empty — run a full rebuild first to seed it")
+        else:
+            _say(f"  test mode: updated {updated} existing rows, skipped {skipped} new")
+    else:
+        _say("Writing Market sheet")
+        # Clear existing data rows (preserve row 1 headers).
+        if market_ws.max_row > 1:
+            market_ws.delete_rows(2, market_ws.max_row - 1)
+        for r_offset, (_, c) in enumerate(constituents.iterrows(), 0):
+            row = 2 + r_offset
+            sym = c["Symbol"]
+            _write_market_structural_row(
+                market_ws, row, c, info_map.get(sym, {}),
+                wl_membership, portfolio, cols,
+            )
         # Quote values and Last update/error are left blank for get_quotes.
 
-    # Re-apply AutoFilter to span the new data extent. If the user has
-    # previously enabled Filter/Sort on Market, openpyxl preserves the
-    # auto_filter object but its ref still points at the OLD row count
-    # after we delete/append data — fix it explicitly.
+    # Re-apply AutoFilter to span the current data extent. In test mode we
+    # preserved the existing rows; in full-rebuild mode we wrote N+1 rows.
     last_col_letter = get_column_letter(len(MARKET_COLUMNS))
-    last_data_row = 1 + len(constituents)
+    last_data_row = market_ws.max_row if test_mode else (1 + len(constituents))
     market_ws.auto_filter.ref = f"A1:{last_col_letter}{last_data_row}"
 
-    # Update Main metadata cells
+    # Update Main metadata cells — but don't pretend Market shrank to 5 rows
+    # in test mode (it still has its full count, we just updated 5 of them).
     main_ws = wb["Main"]
     now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     main_ws[MAIN_CELLS["LastRebuildAt"]] = now_iso
-    main_ws[MAIN_CELLS["MarketRowCount"]] = len(constituents)
+    if not test_mode:
+        main_ws[MAIN_CELLS["MarketRowCount"]] = len(constituents)
 
     wb.save(workbook_path)
     duration = time.time() - t0
-    _say(f"rebuild_inventory: done in {duration:.0f}s. {len(constituents)} rows.")
+    if test_mode:
+        _say(f"rebuild_inventory: done in {duration:.0f}s (test mode).")
+    else:
+        _say(f"rebuild_inventory: done in {duration:.0f}s. {len(constituents)} rows.")
     return 0
 
 
@@ -1674,52 +1722,95 @@ def button_rebuild_inventory() -> None:
             row[MARKET_COLUMNS.index("Description")] = info.get("description") or ""
             rows.append(row)
 
-        status(f"Writing {len(rows)} rows to Market…")
-        # Clear existing data rows + their hyperlinks. clear_contents leaves
-        # hyperlinks attached as ghost references; clear() wipes both.
-        last_row = market.used_range.last_cell.row
-        if last_row >= 2:
-            market.range(f"A2:{get_column_letter(len(MARKET_COLUMNS))}{last_row}").clear()
-        # Bulk write — single COM call
-        if rows:
-            market.range((2, 1)).value = rows
-            # Attach Yahoo hyperlink to each Symbol cell. One COM call per row;
-            # ~975 calls take ~5 sec total which is dwarfed by the .info loop.
-            sym_col_idx = MARKET_COLUMNS.index("Symbol") + 1
-            for offset, row_data in enumerate(rows):
+        sym_col_idx = MARKET_COLUMNS.index("Symbol") + 1
+        if test_mode:
+            # Preserve Market — only update structural columns of rows that
+            # already match by Symbol. Keeps the ranking computation (which
+            # reads ALL Market rows) populated with real stale quote data
+            # instead of seeing just 5 freshly-emptied rows.
+            status(f"Test mode: updating {len(rows)} matching rows in place (no wipe)")
+            existing_last_row = market.used_range.last_cell.row
+            existing_by_sym: dict[str, int] = {}
+            if existing_last_row >= 2:
+                col_letter = get_column_letter(sym_col_idx)
+                syms_in_market = market.range(f"{col_letter}2:{col_letter}{existing_last_row}").value
+                if not isinstance(syms_in_market, list):
+                    syms_in_market = [syms_in_market]
+                for i, v in enumerate(syms_in_market):
+                    if v:
+                        existing_by_sym[str(v).strip().upper()] = 2 + i
+            updated, skipped = 0, 0
+            for row_data in rows:
                 sym = row_data[sym_col_idx - 1]
-                if not sym:
+                target = existing_by_sym.get(str(sym).upper()) if sym else None
+                if target is None:
+                    skipped += 1
                     continue
-                cell = market.range((2 + offset, sym_col_idx))
+                # Write only the structural columns we care about — leave
+                # quote / Last update / Last error cells untouched.
+                for col_name in ("Symbol", "Name", "Owned?", "Indexes", "Sector",
+                                  "Watchlists", "Currency", "Description"):
+                    col_i = MARKET_COLUMNS.index(col_name) + 1
+                    market.range((target, col_i)).value = row_data[col_i - 1]
+                # Refresh the Symbol hyperlink (in case cell.clear was ever called)
+                cell = market.range((target, sym_col_idx))
                 market.api.Hyperlinks.Add(
                     Anchor=cell.api,
                     Address=yahoo_quote_url(sym),
                     TextToDisplay=sym,
                 )
+                updated += 1
+            if skipped and not existing_by_sym:
+                status("Test mode warning: Market is empty — run a full rebuild first to seed it")
+            else:
+                status(f"Test mode: updated {updated}, skipped {skipped} new symbols")
+        else:
+            status(f"Writing {len(rows)} rows to Market…")
+            # Clear existing data rows + their hyperlinks. clear_contents leaves
+            # hyperlinks attached as ghost references; clear() wipes both.
+            last_row = market.used_range.last_cell.row
+            if last_row >= 2:
+                market.range(f"A2:{get_column_letter(len(MARKET_COLUMNS))}{last_row}").clear()
+            # Bulk write — single COM call
+            if rows:
+                market.range((2, 1)).value = rows
+                # Attach Yahoo hyperlink to each Symbol cell. One COM call per row;
+                # ~975 calls take ~5 sec total which is dwarfed by the .info loop.
+                for offset, row_data in enumerate(rows):
+                    sym = row_data[sym_col_idx - 1]
+                    if not sym:
+                        continue
+                    cell = market.range((2 + offset, sym_col_idx))
+                    market.api.Hyperlinks.Add(
+                        Anchor=cell.api,
+                        Address=yahoo_quote_url(sym),
+                        TextToDisplay=sym,
+                    )
 
-            # Column-level formats — one COM call per range, applied to all
-            # data rows in one shot.
-            last_row = 1 + len(rows)
-            for fmt_col_name in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)",
-                                  "1M ago (EUR)", "6M ago (EUR)", "1Y ago (EUR)",
-                                  "5Y ago (EUR)", "P/E (TTM)", "Forward P/E"):
-                col_letter = get_column_letter(MARKET_COLUMNS.index(fmt_col_name) + 1)
-                market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = COMMA_STYLE
-            for _past_label, pct_col in _pct_column_pairs():
-                col_letter = get_column_letter(MARKET_COLUMNS.index(pct_col) + 1)
-                market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = PERCENT_STYLE
-            desc_letter = get_column_letter(MARKET_COLUMNS.index("Description") + 1)
-            market.range(f"{desc_letter}2:{desc_letter}{last_row}").api.WrapText = False
+                # Column-level formats — one COM call per range, applied to all
+                # data rows in one shot.
+                last_row = 1 + len(rows)
+                for fmt_col_name in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)",
+                                      "1M ago (EUR)", "6M ago (EUR)", "1Y ago (EUR)",
+                                      "5Y ago (EUR)", "P/E (TTM)", "Forward P/E"):
+                    col_letter = get_column_letter(MARKET_COLUMNS.index(fmt_col_name) + 1)
+                    market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = COMMA_STYLE
+                for _past_label, pct_col in _pct_column_pairs():
+                    col_letter = get_column_letter(MARKET_COLUMNS.index(pct_col) + 1)
+                    market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = PERCENT_STYLE
+                desc_letter = get_column_letter(MARKET_COLUMNS.index("Description") + 1)
+                market.range(f"{desc_letter}2:{desc_letter}{last_row}").api.WrapText = False
 
-            # Re-apply AutoFilter to span the new data extent. See the
-            # helper docstring for the activation-state workaround.
-            last_col_letter = get_column_letter(len(MARKET_COLUMNS))
-            _xw_reapply_market_autofilter(market, wb, last_col_letter, last_row)
+                # Re-apply AutoFilter to span the new data extent. See the
+                # helper docstring for the activation-state workaround.
+                last_col_letter = get_column_letter(len(MARKET_COLUMNS))
+                _xw_reapply_market_autofilter(market, wb, last_col_letter, last_row)
 
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         main.range(MAIN_CELLS["LastRebuildAt"]).value = now_iso
-        main.range(MAIN_CELLS["MarketRowCount"]).value = len(rows)
-        status(f"rebuild: done. {len(rows)} rows at {now_iso}.")
+        if not test_mode:
+            main.range(MAIN_CELLS["MarketRowCount"]).value = len(rows)
+        status(f"rebuild: done. {len(rows) if not test_mode else 'test mode update'} at {now_iso}.")
     except Exception as e:
         _handle_button_exception(wb, "rebuild_inventory", e, _tb.format_exc())
         # Do NOT re-raise — xlwings/VBA would otherwise show its truncated

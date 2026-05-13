@@ -657,6 +657,75 @@ def test_migrate_monthly_movers_renames_legacy_sheet(tmp_path):
     assert wb2[MONTHLY_WINNERS_SHEET_NAME]["A1"].value == "had data"
 
 
+def test_rebuild_inventory_test_mode_preserves_market(tmp_path, monkeypatch):
+    """Regression for 2026-05-13 'Monthly winners/losers empty in test mode'.
+
+    rebuild_inventory --test used to wipe Market down to 5 rows, which left
+    the subsequent ranking computation (which reads ALL Market rows) with
+    nothing to rank. The fix: in test mode, preserve Market and only update
+    structural columns of rows that match the test constituents by Symbol.
+    """
+    import pandas as pd
+    import stocks_report as sr
+    from openpyxl import load_workbook
+
+    # Build a workbook with a Market sheet that has 50 rows of stale-but-
+    # populated data, including the BEL20 rows the test mode will try to update.
+    path = tmp_path / "preserve_test.xlsx"
+    init_workbook(path)
+    wb = load_workbook(path)
+    market = wb["Market"]
+    cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
+    seed_symbols = ["ABI.BR", "ACKB.BR", "AED.BR", "AGS.BR", "ARGX.BR"] + [
+        f"FAKE{i}" for i in range(45)
+    ]
+    for i, sym in enumerate(seed_symbols, 2):
+        market.cell(row=i, column=cols["Symbol"], value=sym)
+        market.cell(row=i, column=cols["Name"], value=f"stale name for {sym}")
+        market.cell(row=i, column=cols["1D %"], value=0.01)
+        market.cell(row=i, column=cols["1W %"], value=0.02)
+        market.cell(row=i, column=cols["1M %"], value=0.05)
+    wb.save(path)
+
+    # Stub the network-touching helpers so the test doesn't hit Wikipedia / Yahoo.
+    fake_constituents = pd.DataFrame(
+        [(s, f"refreshed {s}", "BEL20") for s in seed_symbols[:5]],
+        columns=["Symbol", "Name", "Index"],
+    )
+    monkeypatch.setattr(sr, "get_index_constituents", lambda idx: fake_constituents)
+    monkeypatch.setattr(sr, "get_etfs", lambda: pd.DataFrame(columns=["Symbol", "Name", "Index"]))
+    monkeypatch.setattr(sr, "fetch_all_watchlists", lambda: {})
+    monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kwargs: {
+        t: {"currency": "EUR", "longName": f"refreshed {t}", "sector": "TestSector"} for t in tickers
+    })
+
+    # Run rebuild in test mode.
+    sr.rebuild_inventory(workbook_path=path, test_mode=True, info_delay=0.0)
+
+    # Market must still have all 50 seed rows.
+    wb2 = load_workbook(path)
+    market2 = wb2["Market"]
+    syms_after = [market2.cell(row=r, column=cols["Symbol"]).value
+                  for r in range(2, market2.max_row + 1)]
+    syms_after = [s for s in syms_after if s]  # drop blanks if any
+    assert len(syms_after) == 50, (
+        f"test mode wiped Market down to {len(syms_after)} rows — must preserve all 50"
+    )
+
+    # The 5 BEL 20 rows must have refreshed Names.
+    for sym in seed_symbols[:5]:
+        row = syms_after.index(sym) + 2
+        assert market2.cell(row=row, column=cols["Name"]).value == f"refreshed {sym}", (
+            f"test mode didn't update structural data for {sym}"
+        )
+
+    # The 45 non-BEL20 stale rows must still have their stale data — % columns
+    # untouched so the ranking computation has something to work with.
+    fake_row = syms_after.index("FAKE0") + 2
+    assert market2.cell(row=fake_row, column=cols["1M %"]).value == 0.05
+    assert market2.cell(row=fake_row, column=cols["Name"]).value == "stale name for FAKE0"
+
+
 def test_migrate_monthly_movers_no_op_when_winners_already_exists(tmp_path):
     """If both legacy and new names exist, migration must NOT clobber the
     new sheet — leave the legacy one alone for the user to delete."""
