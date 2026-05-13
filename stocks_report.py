@@ -892,6 +892,11 @@ VERSION_HISTORY: list[tuple[str, str, str]] = [
 
 DEFAULT_WORKBOOK_PATH = Path(f"stocks_picker_{SCHEMA_VERSION}.xlsm")
 
+# Test mode trims rebuild_inventory aggressively so the smoke completes in
+# a few seconds — top N BEL 20 stocks, no ETFs, no watchlist HTTP. The
+# .info loop is still exercised so any Yahoo regression surfaces.
+TEST_MODE_TICKER_LIMIT = 5
+
 # Where button-triggered errors land. Lives next to the workbook so the user
 # can find it without leaving Excel.
 ERROR_LOG_FILENAME = "stocks_errors.log"
@@ -1333,7 +1338,7 @@ def rebuild_inventory(
         test_mode = read_test_mode(wb["Main"])
     if test_mode:
         indexes = ["BEL20"]
-        _say("Test mode ON — BEL20 only")
+        _say("Test mode ON — BEL20 only (first 5 stocks, no ETFs, no watchlists)")
     elif indexes is None:
         indexes = list(INDEX_WIKI.keys())
     _say(f"rebuild_inventory: starting ({', '.join(indexes)})")
@@ -1343,12 +1348,18 @@ def rebuild_inventory(
 
     _say("Fetching index constituents")
     parts = [get_index_constituents(idx) for idx in indexes]
-    parts.append(get_etfs())
+    if not test_mode:
+        parts.append(get_etfs())
     constituents = aggregate_constituents(parts)
-    _say(f"  Total unique tickers (incl. ETFs): {len(constituents)}")
+    if test_mode:
+        constituents = constituents.head(TEST_MODE_TICKER_LIMIT)
+    _say(f"  Total unique tickers: {len(constituents)}")
 
-    _say("Fetching watchlists")
-    wl_membership = fetch_all_watchlists()
+    if test_mode:
+        wl_membership: dict[str, list[str]] = {}
+    else:
+        _say("Fetching watchlists")
+        wl_membership = fetch_all_watchlists()
 
     _say(f"Fetching .info for {len(constituents)} tickers — this is the slow part")
 
@@ -1537,19 +1548,25 @@ def button_rebuild_inventory() -> None:
     try:
         test_mode = _xw_read_test_mode(main)
         indexes = ["BEL20"] if test_mode else list(INDEX_WIKI.keys())
-        status(f"rebuild: starting ({'TEST: BEL20' if test_mode else 'full'})")
+        status(f"rebuild: starting ({'TEST: BEL20 head' if test_mode else 'full'})")
 
         portfolio = _xw_read_portfolio(main)
         status(f"Portfolio entries: {len(portfolio)}")
 
         status("Fetching index constituents…")
         parts = [get_index_constituents(idx) for idx in indexes]
-        parts.append(get_etfs())
+        if not test_mode:
+            parts.append(get_etfs())
         constituents = aggregate_constituents(parts)
-        status(f"Total unique tickers (incl. ETFs): {len(constituents)}")
+        if test_mode:
+            constituents = constituents.head(TEST_MODE_TICKER_LIMIT)
+        status(f"Total unique tickers: {len(constituents)}")
 
-        status("Fetching watchlists…")
-        wl_membership = fetch_all_watchlists()
+        if test_mode:
+            wl_membership: dict[str, list[str]] = {}
+        else:
+            status("Fetching watchlists…")
+            wl_membership = fetch_all_watchlists()
 
         status(f"Fetching .info for {len(constituents)} tickers (slow step)")
 
