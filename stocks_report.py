@@ -1640,11 +1640,42 @@ def button_rebuild_inventory() -> None:
 
             # Re-apply AutoFilter to span the new data extent. Replaces any
             # prior filter range so it stays in sync with row count.
+            #
+            # Excel COM's `Range.AutoFilter()` (no args) toggles the filter,
+            # but is finicky about activation state — it sometimes raises
+            # "AutoFilter method of Range class failed" when called on a
+            # non-active sheet or right after the .clear() above. We work
+            # around this by (a) making Market the active sheet briefly and
+            # (b) catching any residual failure so the rebuild still
+            # completes; user can re-apply Data → Filter manually if needed.
             last_col_letter = get_column_letter(len(MARKET_COLUMNS))
-            data_range = market.range(f"A1:{last_col_letter}{last_row}")
-            if market.api.AutoFilterMode:
-                market.api.AutoFilterMode = False  # clear, then re-apply
-            data_range.api.AutoFilter()
+            try:
+                if market.api.AutoFilterMode:
+                    market.api.AutoFilterMode = False
+                # Activating the sheet inside ScreenUpdating=False keeps the
+                # user's view stable while the COM call has its preconditions.
+                app = wb.app
+                prev_screen = app.api.ScreenUpdating
+                prev_sheet = wb.api.ActiveSheet
+                app.api.ScreenUpdating = False
+                try:
+                    market.api.Activate()
+                    market.api.Range(f"A1:{last_col_letter}{last_row}").AutoFilter()
+                finally:
+                    try:
+                        prev_sheet.Activate()
+                    except Exception:
+                        pass
+                    app.api.ScreenUpdating = prev_screen
+            except Exception as af_err:
+                log.warning(
+                    f"Couldn't re-apply Market AutoFilter via xlwings: {af_err}. "
+                    "Rebuild data is intact; re-enable via Data → Filter if you want it."
+                )
+                try:
+                    market.api.AutoFilterMode = False  # ensure clean state
+                except Exception:
+                    pass
 
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         main.range(MAIN_CELLS["LastRebuildAt"]).value = now_iso
