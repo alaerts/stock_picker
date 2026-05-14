@@ -1410,9 +1410,13 @@ def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     """
     for col_idx, name in enumerate(MARKET_COLUMNS, 1):
         cell = ws.cell(row=1, column=col_idx)
-        if overwrite or cell.value is None or cell.value != name:
+        needs_value_write = overwrite or cell.value is None or cell.value != name
+        if needs_value_write:
             cell.value = name
-        if overwrite:
+            # Re-style any cell whose value we just (re)wrote — covers
+            # columns added on a schema bump that would otherwise inherit
+            # the prior cell's (or no) styling. Cells whose value already
+            # matched keep the user's cosmetic edits.
             _bold(cell)
             cell.fill = PatternFill("solid", fgColor="F2F2F2")
     ws.freeze_panes = "A2"
@@ -1912,6 +1916,10 @@ def _xw_ensure_market_headers(market_xw, status: Optional[Callable[[str], None]]
     if status is not None:
         status("Refreshing Market header row (schema may have changed)")
     market_xw.range("A1").value = [list(MARKET_COLUMNS)]
+    # Re-assert bold on the full header range — any cell whose value we
+    # just rewrote may have lost styling (e.g. v04's Industry column
+    # taking over col 6 from Watchlists).
+    market_xw.range(f"A1:{last_col_letter}1").api.Font.Bold = True
     return True
 
 
@@ -2469,6 +2477,11 @@ def button_get_quotes() -> None:
             if fx.get("GBP") is not None and not pd.isna(fx["GBP"]):
                 main.range(MAIN_CELLS["EurGbp"]).value = float(fx["GBP"])
 
+        # Re-apply Market AutoFilter — same reasoning as the CLI path.
+        last_col_letter = get_column_letter(len(MARKET_COLUMNS))
+        last_row_market = market.used_range.last_cell.row
+        _xw_reapply_market_autofilter(market, wb, last_col_letter, last_row_market)
+
         status(f"quotes: done. {ok} ok, {fail} failed at {now_iso}.")
     except Exception as e:
         _handle_button_exception(wb, "get_quotes", e, _tb.format_exc())
@@ -2479,7 +2492,10 @@ def button_get_quotes() -> None:
 # ---------------------------------------------------------------------------
 
 CURRENCY_HEADERS = ["Pair"] + list(LOOKBACKS.keys())  # "Pair", "Today", "1D ago", ...
-FX_RATE_FORMAT = "#,##0.0000"  # FX needs more precision than equities
+# Accounting-style "Comma Style" format with 4 decimal places — matches the
+# Comma button on Excel's Home ribbon but keeps the precision FX rates need
+# (EUR/USD at 2dp would round 1.1735 → 1.17 and hide intra-week moves).
+FX_RATE_FORMAT = '_-* #,##0.0000_-;-* #,##0.0000_-;_-* "-"????_-;_-@_-'
 
 
 def _currency_rows(fx_history: dict[str, pd.Series]) -> list[list]:
@@ -2504,13 +2520,13 @@ def _ensure_currencies_sheet_openpyxl(wb, fx_history: dict[str, pd.Series]) -> N
         ws = wb[CURRENCIES_SHEET_NAME]
         is_new = False
 
-    # Header — re-assert text (column-name contract) but apply styling/widths
-    # only on first creation so user cosmetics survive.
+    # Header — re-assert text + styling whenever a value was (re)written.
+    # Cells whose value already matches keep user-set cosmetics.
     for col_idx, name in enumerate(CURRENCY_HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx)
-        if is_new or cell.value != name:
+        needs_value_write = is_new or cell.value != name
+        if needs_value_write:
             cell.value = name
-        if is_new:
             cell.font = Font(bold=True)
             cell.fill = PatternFill("solid", fgColor="F2F2F2")
     if is_new:
@@ -2546,10 +2562,13 @@ def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) ->
     else:
         cur = wb_xw.sheets[CURRENCIES_SHEET_NAME]
         is_new = False
-    # Header
+    # Header — always re-assert text AND bold. Bold-on-every-run prevents the
+    # situation where a schema bump that adds a column ends up with one
+    # un-bold cell while the rest are bold (the 2026-05-14 ranking-sheet
+    # I1 bug class).
     cur.range("A1").value = [CURRENCY_HEADERS]
+    cur.range(f"A1:{get_column_letter(len(CURRENCY_HEADERS))}1").api.Font.Bold = True
     if is_new:
-        cur.range(f"A1:{get_column_letter(len(CURRENCY_HEADERS))}1").api.Font.Bold = True
         cur.api.Range("A2").Select()  # ignored; intent is to freeze
         cur.api.Application.ActiveWindow.FreezePanes = False
         # Use COM Window object for freeze pane
@@ -2793,9 +2812,12 @@ def _ensure_ranking_sheet_openpyxl(wb, sheet_name: str, rows: list[dict],
 
     for col_idx, name in enumerate(RANKING_HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx)
-        if is_new or cell.value != name:
+        needs_value_write = is_new or cell.value != name
+        if needs_value_write:
             cell.value = name
-        if is_new:
+            # Style any header cell whose value we just (re)wrote — without
+            # this, a schema bump that adds a column ends up with one
+            # un-bold cell while the rest are bold (the 2026-05-14 I1 bug).
             cell.font = Font(bold=True)
             cell.fill = PatternFill("solid", fgColor="F2F2F2")
     if is_new:
@@ -2851,9 +2873,10 @@ def _ensure_ranking_sheet_xlwings(wb_xw, sheet_name: str, rows: list[dict],
         sh = wb_xw.sheets[sheet_name]
         is_new = False
 
+    # Header — always re-assert text + bold. Same fix as Currencies + Market:
+    # a column added on a schema bump would otherwise inherit no styling.
     sh.range("A1").value = [RANKING_HEADERS]
-    if is_new:
-        sh.range(f"A1:{get_column_letter(len(RANKING_HEADERS))}1").api.Font.Bold = True
+    sh.range(f"A1:{get_column_letter(len(RANKING_HEADERS))}1").api.Font.Bold = True
 
     last_row_now = sh.used_range.last_cell.row
     if last_row_now >= 2:
@@ -3197,6 +3220,13 @@ def get_quotes(
             main_ws[MAIN_CELLS["EurJpy"]] = float(fx["JPY"])
         if fx.get("GBP") is not None and not pd.isna(fx["GBP"]):
             main_ws[MAIN_CELLS["EurGbp"]] = float(fx["GBP"])
+
+    # Re-apply Market AutoFilter — Excel sometimes strips an openpyxl-set
+    # filter when the user opens+saves the workbook manually. Re-asserting
+    # it on every code path that touches Market means the next CLI run
+    # restores the filter if Excel dropped it.
+    last_col_letter = get_column_letter(len(MARKET_COLUMNS))
+    market_ws.auto_filter.ref = f"A1:{last_col_letter}{market_ws.max_row}"
 
     wb.save(workbook_path)
     duration = time.time() - t0

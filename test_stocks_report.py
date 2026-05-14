@@ -1832,5 +1832,143 @@ def test_no_get_yahoo_session_export():
     )
 
 
+# ---------------------------------------------------------------------------
+# 2026-05-14 user-reported batch: missing AutoFilter, unbold I1, comma format
+# ---------------------------------------------------------------------------
+
+def test_ranking_sheet_rewrites_header_bold_on_new_column(tmp_path):
+    """Regression for the 'Monthly winner I1 formatting is wrong' bug.
+
+    When a schema bump adds a column to RANKING_HEADERS (v03 added Owned?),
+    the old sheet still exists. The function rewrites the new column's
+    value but used to skip bold styling unless is_new=True. Result: that
+    one new header cell ended up bold=False while the rest were bold=True.
+    """
+    from openpyxl import Workbook
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sr.MONTHLY_WINNERS_SHEET_NAME
+    # Simulate a pre-schema-bump sheet: only the FIRST 8 RANKING_HEADERS,
+    # with bold applied (mimicking the v02 state before Owned? was added).
+    from openpyxl.styles import Font, PatternFill
+    pre_v03_headers = [h for h in sr.RANKING_HEADERS if h != "Owned?"]
+    for i, name in enumerate(pre_v03_headers, 1):
+        c = ws.cell(row=1, column=i, value=name)
+        c.font = Font(bold=True)
+        c.fill = PatternFill("solid", fgColor="F2F2F2")
+    # Now run the helper — it should add the Owned? header AND style it.
+    sr._ensure_ranking_sheet_openpyxl(wb, sr.MONTHLY_WINNERS_SHEET_NAME, [])
+    ws2 = wb[sr.MONTHLY_WINNERS_SHEET_NAME]
+    for i, name in enumerate(sr.RANKING_HEADERS, 1):
+        cell = ws2.cell(row=1, column=i)
+        assert cell.value == name, f"col {i}: {cell.value!r} != {name!r}"
+        assert cell.font.bold is True, (
+            f"col {i} ({name}) is NOT bold — was the cell added in a schema "
+            "bump without being styled? See the 2026-05-14 I1 bug."
+        )
+
+
+def test_market_layout_rewrites_header_bold_on_new_column(tmp_path):
+    """Same family of bug for Market: v04 added Industry at col 6.
+    A workbook with pre-v04 headers must end up with all 26 header cells bold."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Market"
+    pre_v04 = [c for c in sr.MARKET_COLUMNS if c != "Industry"]
+    for i, name in enumerate(pre_v04, 1):
+        c = ws.cell(row=1, column=i, value=name)
+        c.font = Font(bold=True)  # all bold before the schema bump
+    sr._layout_market_sheet(ws, overwrite=False)
+    for i, name in enumerate(sr.MARKET_COLUMNS, 1):
+        cell = ws.cell(row=1, column=i)
+        assert cell.value == name
+        assert cell.font.bold is True, (
+            f"Market col {i} ({name}) is not bold after _layout_market_sheet "
+            "rewrote the header — schema-bump styling bug."
+        )
+
+
+def test_currencies_sheet_rewrites_header_bold_on_new_column(tmp_path):
+    """Currencies sheet: same bug class — if a new lookback is added to
+    LOOKBACKS, the new header column must end up bold."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.create_sheet(sr.CURRENCIES_SHEET_NAME)
+    # Pre-state: missing the last header.
+    pre_state = sr.CURRENCY_HEADERS[:-1]
+    for i, name in enumerate(pre_state, 1):
+        c = ws.cell(row=1, column=i, value=name)
+        c.font = Font(bold=True)
+    # Run the helper with empty fx_history so it does just the header work.
+    sr._ensure_currencies_sheet_openpyxl(wb, {})
+    ws2 = wb[sr.CURRENCIES_SHEET_NAME]
+    for i, name in enumerate(sr.CURRENCY_HEADERS, 1):
+        cell = ws2.cell(row=1, column=i)
+        assert cell.value == name
+        assert cell.font.bold is True, (
+            f"Currencies col {i} ({name}) is not bold — same family as I1 bug."
+        )
+
+
+def test_get_quotes_applies_market_autofilter(tmp_path, monkeypatch):
+    """Regression: Excel sometimes strips an openpyxl-set AutoFilter when
+    the user saves the workbook manually. get_quotes must re-apply it so
+    the next CLI run restores filtering. Previously only rebuild_inventory
+    set the filter and a stale-from-Excel state would persist."""
+    import stocks_report as sr
+    from openpyxl import load_workbook
+    path = tmp_path / "af_test.xlsx"
+    init_workbook(path)
+    # Seed Market with a couple of rows and verify autofilter starts None
+    wb = load_workbook(path)
+    market = wb["Market"]
+    cols = {n: sr.MARKET_COLUMNS.index(n) + 1 for n in sr.MARKET_COLUMNS}
+    for i, sym in enumerate(["AAA.BR", "BBB.BR"], 2):
+        market.cell(row=i, column=cols["Symbol"], value=sym)
+        market.cell(row=i, column=cols["Currency"], value="EUR")
+        market.cell(row=i, column=cols["Indexes"], value="BEL20")
+    market.auto_filter.ref = None  # simulate Excel stripping the filter
+    wb.save(path)
+
+    # Stub network paths so test runs fast/offline
+    monkeypatch.setattr(sr, "get_fx_rates", lambda: {"EUR": 1.0, "USD": 1.1, "JPY": 180.0,
+                                                       "GBP": 0.85, "CHF": 0.95, "GBp": 0.85})
+    monkeypatch.setattr(sr, "get_fx_history", lambda: {})
+    monkeypatch.setattr(sr, "fetch_close_prices",
+                        lambda tickers, start, end, **kw: pd.DataFrame())
+    monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw: {
+        t: {"trailingPE": None, "forwardPE": None} for t in tickers
+    })
+
+    sr.get_quotes(workbook_path=path, test_mode=False)
+
+    wb2 = load_workbook(path)
+    market2 = wb2["Market"]
+    assert market2.auto_filter.ref is not None, (
+        "get_quotes did not re-apply Market AutoFilter — Excel stripped state "
+        "would persist forever."
+    )
+    assert market2.auto_filter.ref.startswith("A1:")
+
+
+def test_fx_rate_format_is_comma_style():
+    """The Currencies sheet number format must be Excel's Comma/Accounting
+    style (matches the EUR price columns in Market) — not a plain
+    '#,##0.0000'. User asked for this on 2026-05-14."""
+    import stocks_report as sr
+    # The format should contain underscore-padded accounting-style placeholders.
+    assert "_-" in sr.FX_RATE_FORMAT, (
+        f"FX_RATE_FORMAT={sr.FX_RATE_FORMAT!r} is not in accounting/comma style"
+    )
+    # Still 4 decimals (FX precision requirement, not the default 2dp).
+    assert "0.0000" in sr.FX_RATE_FORMAT
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
