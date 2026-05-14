@@ -31,4 +31,4 @@ stocks_info_cache.sqlite-journal
 .DS_Store
 .vscode/
 .idea/
-.claude/settings.local.json
+.claude/  # all Claude Code local session state (locks, worktrees, settings)
