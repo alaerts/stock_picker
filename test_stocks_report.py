@@ -1960,14 +1960,66 @@ def test_get_quotes_applies_market_autofilter(tmp_path, monkeypatch):
 def test_fx_rate_format_is_comma_style():
     """The Currencies sheet number format must be Excel's Comma/Accounting
     style (matches the EUR price columns in Market) — not a plain
-    '#,##0.0000'. User asked for this on 2026-05-14."""
+    '#,##0.0000'. User asked for this on 2026-05-14, then on the same day
+    requested 2dp (matching COMMA_STYLE)."""
     import stocks_report as sr
     # The format should contain underscore-padded accounting-style placeholders.
     assert "_-" in sr.FX_RATE_FORMAT, (
         f"FX_RATE_FORMAT={sr.FX_RATE_FORMAT!r} is not in accounting/comma style"
     )
-    # Still 4 decimals (FX precision requirement, not the default 2dp).
-    assert "0.0000" in sr.FX_RATE_FORMAT
+    # 2 decimals — explicit request from the user, consistent with Market's
+    # EUR price columns (which also use COMMA_STYLE at 2dp).
+    assert sr.FX_RATE_FORMAT == sr.COMMA_STYLE
+    assert "0.00" in sr.FX_RATE_FORMAT
+    assert "0.0000" not in sr.FX_RATE_FORMAT
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-14 batch 2: status freq, FX 2dp, Help self-heal, setup-buttons idempotency
+# ---------------------------------------------------------------------------
+
+def test_fx_rate_format_equals_comma_style():
+    """User asked for comma style with 2 decimals on currencies — same format
+    Market's EUR price columns use."""
+    import stocks_report as sr
+    assert sr.FX_RATE_FORMAT == sr.COMMA_STYLE
+
+
+def test_help_sheet_self_heals_when_versions_missing(tmp_path):
+    """A workbook that predates VERSION_HISTORY auto-population (e.g. user
+    upgraded by renaming files) must have its Help sheet populated on the
+    next get_quotes — the function is now called from get_quotes' end."""
+    from openpyxl import Workbook, load_workbook
+    import stocks_report as sr
+    wb = Workbook()
+    h = wb.active
+    h.title = sr.HELP_SHEET_NAME
+    h["A1"] = "User credit line"  # mimics user state — no version rows
+    # Run the self-heal directly (same call get_quotes makes).
+    sr._ensure_help_sheet_versions(h, fresh=False)
+    # Walk column A; we should now find rows starting with each version slug.
+    values = [h.cell(row=r, column=1).value for r in range(1, h.max_row + 1)]
+    for ver, _date, _summary in sr.VERSION_HISTORY:
+        assert ver in values, f"version {ver} not in Help sheet after self-heal"
+    # User content preserved.
+    assert values[0] == "User credit line"
+
+
+def test_help_sheet_self_heal_is_idempotent(tmp_path):
+    """Calling the self-heal twice in a row must not duplicate rows."""
+    from openpyxl import Workbook
+    import stocks_report as sr
+    wb = Workbook()
+    h = wb.active
+    h.title = sr.HELP_SHEET_NAME
+    sr._ensure_help_sheet_versions(h, fresh=True)
+    rows_after_first = h.max_row
+    sr._ensure_help_sheet_versions(h, fresh=False)
+    rows_after_second = h.max_row
+    assert rows_after_first == rows_after_second, (
+        f"Help sheet grew from {rows_after_first} → {rows_after_second} rows "
+        "on a second call — self-heal is not idempotent"
+    )
 
 
 if __name__ == "__main__":

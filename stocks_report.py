@@ -1588,6 +1588,59 @@ def init_workbook(path: Path) -> Path:
     return path
 
 
+def _ensure_help_sheet_versions_xlwings(wb_xw) -> None:
+    """xlwings equivalent of `_ensure_help_sheet_versions` (no-fresh).
+
+    Walks the Help sheet looking for tokens that match a VERSION_HISTORY
+    version slug; appends any missing entries below the last used row.
+    Idempotent — safe to call on every get_quotes.
+    """
+    sheet_names = [s.name for s in wb_xw.sheets]
+    if HELP_SHEET_NAME not in sheet_names:
+        return
+    help_xw = wb_xw.sheets[HELP_SHEET_NAME]
+    # Read column A as a list to find both last used row and existing mentions.
+    last_row = help_xw.used_range.last_cell.row if help_xw.used_range.last_cell else 0
+    if last_row < 1:
+        col_a = []
+    else:
+        col_a = help_xw.range(f"A1:A{last_row}").value
+        if not isinstance(col_a, list):
+            col_a = [col_a]
+    mentioned: set[str] = set()
+    last_used_row = 0
+    for idx, v in enumerate(col_a, 1):
+        if v is not None:
+            last_used_row = idx
+            if isinstance(v, str):
+                token = v.strip().lower()
+                for ver, _date, _summary in VERSION_HISTORY:
+                    if token == ver.lower():
+                        mentioned.add(ver)
+    next_row = last_used_row + 1 if last_used_row else 1
+    # Leave a blank spacer when user has prior content but no version yet.
+    if not mentioned and last_used_row > 0:
+        next_row = last_used_row + 2
+    appended = 0
+    for ver, date, summary in VERSION_HISTORY:
+        if ver in mentioned:
+            continue
+        help_xw.range((next_row, 1)).value = ver
+        help_xw.range((next_row, 1)).api.Font.Bold = True
+        help_xw.range((next_row, 2)).value = date
+        help_xw.range((next_row, 3)).value = summary
+        # Wrap the long summary cell so it doesn't run off-screen.
+        try:
+            help_xw.range((next_row, 3)).api.WrapText = True
+            help_xw.range((next_row, 3)).api.VerticalAlignment = -4160  # xlTop
+        except Exception:
+            pass
+        next_row += 1
+        appended += 1
+    if appended:
+        log.info(f"  Help sheet: appended {appended} version entr{'y' if appended == 1 else 'ies'}")
+
+
 def _ensure_help_sheet_versions(ws: Worksheet, *, fresh: bool) -> None:
     """Make sure every entry in VERSION_HISTORY has a row on the Help sheet.
 
@@ -2412,13 +2465,19 @@ def button_get_quotes() -> None:
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
 
+        # Per-row write involves ~5 xlwings COM calls; on a 986-ticker run the
+        # write loop dominates the visible "wait" after .info finishes. Refresh
+        # the Status cell every WRITE_STATUS_EVERY rows so the user sees motion.
+        WRITE_STATUS_EVERY = 50
         ok = 0
         fail = 0
-        for (row_idx, sym, ccy, _indexes_csv) in targets:
+        for i, (row_idx, sym, ccy, _indexes_csv) in enumerate(targets, 1):
             # Stop check between rows (in case the per-row loop is itself slow)
             if _xw_read_stop_requested(main):
                 status(f"STOP detected — refreshed {ok} of {len(targets)} rows")
                 break
+            if i == 1 or i % WRITE_STATUS_EVERY == 0 or i == len(targets):
+                status(f"Writing quote columns: {i}/{len(targets)} ({sym})")
             try:
                 series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
                 eur_by_label = {}
@@ -2468,14 +2527,20 @@ def button_get_quotes() -> None:
             filter_owned_yes=has_owned_losers,
         )
 
+        # Self-heal the Help sheet — appends any missing VERSION_HISTORY
+        # entries. Idempotent. Needed for workbooks that predate the
+        # auto-population (e.g. user renamed v01 → v02 → v03 → v04 without
+        # ever re-running init-workbook).
+        _ensure_help_sheet_versions_xlwings(wb)
+
         main.range(MAIN_CELLS["LastQuotesAt"]).value = now_iso
         if not test_mode:
-            if fx.get("USD") is not None and not pd.isna(fx["USD"]):
-                main.range(MAIN_CELLS["EurUsd"]).value = float(fx["USD"])
-            if fx.get("JPY") is not None and not pd.isna(fx["JPY"]):
-                main.range(MAIN_CELLS["EurJpy"]).value = float(fx["JPY"])
-            if fx.get("GBP") is not None and not pd.isna(fx["GBP"]):
-                main.range(MAIN_CELLS["EurGbp"]).value = float(fx["GBP"])
+            for ccy_key, cell_key in [("USD", "EurUsd"), ("JPY", "EurJpy"), ("GBP", "EurGbp")]:
+                v = fx.get(ccy_key)
+                if v is not None and not pd.isna(v):
+                    rng = main.range(MAIN_CELLS[cell_key])
+                    rng.value = float(v)
+                    rng.api.NumberFormat = COMMA_STYLE
 
         # Re-apply Market AutoFilter — same reasoning as the CLI path.
         last_col_letter = get_column_letter(len(MARKET_COLUMNS))
@@ -2492,10 +2557,11 @@ def button_get_quotes() -> None:
 # ---------------------------------------------------------------------------
 
 CURRENCY_HEADERS = ["Pair"] + list(LOOKBACKS.keys())  # "Pair", "Today", "1D ago", ...
-# Accounting-style "Comma Style" format with 4 decimal places — matches the
-# Comma button on Excel's Home ribbon but keeps the precision FX rates need
-# (EUR/USD at 2dp would round 1.1735 → 1.17 and hide intra-week moves).
-FX_RATE_FORMAT = '_-* #,##0.0000_-;-* #,##0.0000_-;_-* "-"????_-;_-@_-'
+# Excel's "Comma Style" format with 2 decimal places — same format as
+# Market's EUR price columns (COMMA_STYLE). User chose 2dp on 2026-05-14;
+# previously 4dp for FX precision but the user prefers consistency with
+# the rest of the workbook's price columns.
+FX_RATE_FORMAT = COMMA_STYLE
 
 
 def _currency_rows(fx_history: dict[str, pd.Series]) -> list[list]:
@@ -3209,17 +3275,26 @@ def get_quotes(
         filter_owned_yes=has_owned_losers,
     )
 
+    # Self-heal the Help sheet — append any missing VERSION_HISTORY entries.
+    # Idempotent; existing rows are left alone. Needed for workbooks that
+    # predate the VERSION_HISTORY auto-population (e.g. user upgraded from
+    # v01 by renaming the file rather than re-running init-workbook).
+    if HELP_SHEET_NAME in wb.sheetnames:
+        _ensure_help_sheet_versions(wb[HELP_SHEET_NAME], fresh=False)
+
     # Update Main metadata
     main_ws[MAIN_CELLS["LastQuotesAt"]] = now_iso
     if not test_mode:
         # Don't overwrite the headline FX values in test mode — they only describe
-        # a 1-symbol run which is rarely interesting.
-        if fx.get("USD") is not None and not pd.isna(fx["USD"]):
-            main_ws[MAIN_CELLS["EurUsd"]] = float(fx["USD"])
-        if fx.get("JPY") is not None and not pd.isna(fx["JPY"]):
-            main_ws[MAIN_CELLS["EurJpy"]] = float(fx["JPY"])
-        if fx.get("GBP") is not None and not pd.isna(fx["GBP"]):
-            main_ws[MAIN_CELLS["EurGbp"]] = float(fx["GBP"])
+        # a 1-symbol run which is rarely interesting. Write WITH comma-style
+        # number format so the values render consistently with the Currencies
+        # sheet and the Market EUR price columns.
+        for ccy_key, cell_key in [("USD", "EurUsd"), ("JPY", "EurJpy"), ("GBP", "EurGbp")]:
+            v = fx.get(ccy_key)
+            if v is not None and not pd.isna(v):
+                cell = main_ws[MAIN_CELLS[cell_key]]
+                cell.value = float(v)
+                cell.number_format = COMMA_STYLE
 
     # Re-apply Market AutoFilter — Excel sometimes strips an openpyxl-set
     # filter when the user opens+saves the workbook manually. Re-asserting
@@ -3295,6 +3370,12 @@ def _cmd_setup_buttons(args) -> int:
 
     log.info(f"Opening {src} in Excel (headless)")
     app = xw.App(visible=False, add_book=False)
+    # Suppress overwrite/SaveAs dialogs so re-running setup-buttons on an
+    # existing .xlsm doesn't hang waiting for user input.
+    try:
+        app.api.DisplayAlerts = False
+    except Exception:
+        pass
     try:
         wb = app.books.open(str(src))
         main = wb.sheets["Main"]
@@ -3373,11 +3454,14 @@ def _cmd_setup_buttons(args) -> int:
         except Exception:
             pass
 
-        # 2. Remove any prior StockPicker_* shapes we added (idempotent —
-        #    covers buttons + the test-mode checkbox).
-        for shp in list(main.shapes):
-            if shp.name.startswith("StockPicker_"):
-                shp.delete()
+        # 2. Per-shape idempotency: skip any StockPicker_* shape that already
+        #    exists by name. This lets us re-run setup-buttons to add shapes
+        #    that were added in later schema versions (e.g. the STOP checkbox
+        #    introduced after the original setup) without disturbing user
+        #    cosmetic moves on the existing buttons.
+        existing_shape_names = {shp.name for shp in main.shapes
+                                if shp.name.startswith("StockPicker_")}
+        sheet_api = main.api
 
         # 3. Add two buttons + a Test-mode checkbox in the Jobs area to the
         #    right of column B. Column A (~38 chars ≈ 270 px) and column B
@@ -3386,33 +3470,35 @@ def _cmd_setup_buttons(args) -> int:
         #    Shapes.AddFormControl(type, left, top, w, h):
         #      0 = msoFormControlButton
         #      1 = msoFormControlCheckBox
-        sheet_api = main.api
-        btn1 = sheet_api.Shapes.AddFormControl(0, 720, 10, 130, 28)
-        btn1.Name = "StockPicker_Rebuild"
-        btn1.TextFrame.Characters().Text = "Rebuild Inventory"
-        btn1.OnAction = "RebuildInventory"
-        btn2 = sheet_api.Shapes.AddFormControl(0, 720, 42, 130, 28)
-        btn2.Name = "StockPicker_GetQuotes"
-        btn2.TextFrame.Characters().Text = "Get Quotes"
-        btn2.OnAction = "GetQuotes"
+        if "StockPicker_Rebuild" not in existing_shape_names:
+            btn1 = sheet_api.Shapes.AddFormControl(0, 720, 10, 130, 28)
+            btn1.Name = "StockPicker_Rebuild"
+            btn1.TextFrame.Characters().Text = "Rebuild Inventory"
+            btn1.OnAction = "RebuildInventory"
+        if "StockPicker_GetQuotes" not in existing_shape_names:
+            btn2 = sheet_api.Shapes.AddFormControl(0, 720, 42, 130, 28)
+            btn2.Name = "StockPicker_GetQuotes"
+            btn2.TextFrame.Characters().Text = "Get Quotes"
+            btn2.OnAction = "GetQuotes"
 
         # 4. Add a Test-mode checkbox, linked to Main!B5 (the existing
         #    MAIN_CELLS["TestMode"] address). Excel writes TRUE/FALSE into
         #    the linked cell automatically when the user clicks it, and
         #    read_test_mode() already understands those values.
-        chk = sheet_api.Shapes.AddFormControl(1, 720, 78, 160, 24)
-        chk.Name = "StockPicker_TestMode"
-        chk.TextFrame.Characters().Text = "Test mode (BEL20 + 1 quote)"
-        chk.ControlFormat.LinkedCell = f"Main!{MAIN_CELLS['TestMode']}"
-        # Default state: unchecked (xlOff = -4146). If the user previously
-        # set the cell to TRUE manually, mirror that into the checkbox.
-        existing = main.range(MAIN_CELLS["TestMode"]).value
-        if isinstance(existing, str) and existing.strip().upper() in _TEST_MODE_TRUTHY:
-            chk.ControlFormat.Value = 1   # xlOn
-        elif existing is True:
-            chk.ControlFormat.Value = 1
-        else:
-            chk.ControlFormat.Value = -4146  # xlOff
+        if "StockPicker_TestMode" not in existing_shape_names:
+            chk = sheet_api.Shapes.AddFormControl(1, 720, 78, 160, 24)
+            chk.Name = "StockPicker_TestMode"
+            chk.TextFrame.Characters().Text = "Test mode (BEL20 + 1 quote)"
+            chk.ControlFormat.LinkedCell = f"Main!{MAIN_CELLS['TestMode']}"
+            # Default state: unchecked (xlOff = -4146). If the user previously
+            # set the cell to TRUE manually, mirror that into the checkbox.
+            existing_val = main.range(MAIN_CELLS["TestMode"]).value
+            if isinstance(existing_val, str) and existing_val.strip().upper() in _TEST_MODE_TRUTHY:
+                chk.ControlFormat.Value = 1   # xlOn
+            elif existing_val is True:
+                chk.ControlFormat.Value = 1
+            else:
+                chk.ControlFormat.Value = -4146  # xlOff
 
         # 5. Add the STOP checkbox, linked to Main!StopRequested. Excel
         #    Form Controls write their state to LinkedCell via the internal
@@ -3431,18 +3517,19 @@ def _cmd_setup_buttons(args) -> int:
             main.range(MAIN_CELLS["JobRunning"]).api.NumberFormat = ";;;"
         except Exception:
             pass
-        stop_chk = sheet_api.Shapes.AddFormControl(1, 720, 110, 200, 28)
-        stop_chk.Name = "StockPicker_Stop"
-        stop_chk.TextFrame.Characters().Text = "⛔ STOP running job"
-        # Make the STOP label visually distinctive (red bold) so the user
-        # never confuses it with the Test-mode checkbox above.
-        try:
-            stop_chk.TextFrame.Characters().Font.Bold = True
-            stop_chk.TextFrame.Characters().Font.Color = 255  # red (BGR=0x0000FF)
-        except Exception:
-            pass
-        stop_chk.ControlFormat.LinkedCell = f"Main!{MAIN_CELLS['StopRequested']}"
-        stop_chk.ControlFormat.Value = -4146  # xlOff at install
+        if "StockPicker_Stop" not in existing_shape_names:
+            stop_chk = sheet_api.Shapes.AddFormControl(1, 720, 110, 200, 28)
+            stop_chk.Name = "StockPicker_Stop"
+            stop_chk.TextFrame.Characters().Text = "⛔ STOP running job"
+            # Make the STOP label visually distinctive (red bold) so the user
+            # never confuses it with the Test-mode checkbox above.
+            try:
+                stop_chk.TextFrame.Characters().Font.Bold = True
+                stop_chk.TextFrame.Characters().Font.Color = 255  # red (BGR=0x0000FF)
+            except Exception:
+                pass
+            stop_chk.ControlFormat.LinkedCell = f"Main!{MAIN_CELLS['StopRequested']}"
+            stop_chk.ControlFormat.Value = -4146  # xlOff at install
 
         # 6. SaveAs .xlsm (FileFormat 52 = xlOpenXMLWorkbookMacroEnabled).
         if target.exists() and target != src:
