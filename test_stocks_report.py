@@ -2095,5 +2095,103 @@ def test_info_cache_does_not_purge_current_schema_rows(tmp_path):
     assert out["AAPL"]["industry"] == "Consumer Electronics"
 
 
+def test_market_header_always_styled_even_when_value_unchanged(tmp_path):
+    """Regression for 'Last error' formatting bug: Z1 had always held
+    'Last error' since v01, so the prior style-on-value-change rule never
+    fired for it — it stayed bold=False while the rest of the row was bold.
+    Fix: re-style on every call, regardless of whether the value changed."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Market"
+    # Pre-state: every header value already matches MARKET_COLUMNS, but
+    # one of them is NOT bold (mimics a v01-era unstyled cell).
+    for i, name in enumerate(sr.MARKET_COLUMNS, 1):
+        c = ws.cell(row=1, column=i, value=name)
+        c.font = Font(bold=(name != "Last error"))  # Last error explicitly unbold
+    sr._layout_market_sheet(ws, overwrite=False)
+    last_err = ws.cell(row=1, column=sr.MARKET_COLUMNS.index("Last error") + 1)
+    assert last_err.value == "Last error"
+    assert last_err.font.bold is True, (
+        "Last error header is still un-bold after _layout_market_sheet — "
+        "the style-on-every-call fix didn't take."
+    )
+
+
+def test_market_widths_reset_to_defaults_on_layout(tmp_path):
+    """Every _layout_market_sheet call resets column widths to the canonical
+    defaults. Previously we tried to 'preserve user widths' but Excel +
+    openpyxl roundtrips left auto-default values stored as if they were
+    custom (e.g. Last error col ended up at width=13 with no user edit).
+    Always-apply gives the user a predictable, usable layout on rerun."""
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
+    import stocks_report as sr
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Market"
+    for i, name in enumerate(sr.MARKET_COLUMNS, 1):
+        ws.cell(row=1, column=i, value=name)
+    # Pre-state: a stale-looking width on Last error (mimics user's workbook).
+    last_err_idx = sr.MARKET_COLUMNS.index("Last error") + 1
+    ws.column_dimensions[get_column_letter(last_err_idx)].width = 13.0
+    sr._layout_market_sheet(ws, overwrite=False)
+    # Last error width reset to the canonical 30.
+    assert ws.column_dimensions[get_column_letter(last_err_idx)].width == 30
+    # Sector width reset to the canonical 22.
+    sec_idx = sr.MARKET_COLUMNS.index("Sector") + 1
+    assert ws.column_dimensions[get_column_letter(sec_idx)].width == 22
+
+
+def test_ranking_headers_include_pe_and_watchlists():
+    """v04+ ranking sheets surface the P/E ratios and Watchlists so the
+    user can spot value vs growth + smart-money tagging directly on
+    Monthly winners / losers without flipping back to Market."""
+    import stocks_report as sr
+    for col in ("P/E (TTM)", "Forward P/E", "Watchlists"):
+        assert col in sr.RANKING_HEADERS, f"{col} missing from RANKING_HEADERS"
+
+
+def test_ranking_row_values_aligns_with_headers():
+    """Every position in RANKING_HEADERS must map to a value via _ranking_row_values.
+    Catches the off-by-one if someone adds a header without updating the mapper."""
+    import stocks_report as sr
+    m = {
+        "symbol": "AAPL", "name": "Apple", "owned": "Yes", "indexes": "SP500",
+        "sector": "Technology", "today": 200.0, "pct_1d": 0.01, "pct_1w": 0.02,
+        "pct_1m": 0.05, "pe_ttm": 30.0, "pe_fwd": 25.0, "watchlists": "BRK, S&P",
+    }
+    values = sr._ranking_row_values(m)
+    assert len(values) == len(sr.RANKING_HEADERS)
+    # Spot-check the new columns are populated.
+    assert values[sr.RANKING_HEADERS.index("P/E (TTM)")] == 30.0
+    assert values[sr.RANKING_HEADERS.index("Forward P/E")] == 25.0
+    assert values[sr.RANKING_HEADERS.index("Watchlists")] == "BRK, S&P"
+
+
+def test_read_market_records_openpyxl_surfaces_pe_and_watchlists(tmp_path):
+    """The Market → ranking pipeline now reads P/E and Watchlists too.
+    Without this the new RANKING_HEADERS columns would just be empty."""
+    from openpyxl import Workbook
+    import stocks_report as sr
+    wb = Workbook()
+    market = wb.active
+    market.title = "Market"
+    for i, name in enumerate(sr.MARKET_COLUMNS, 1):
+        market.cell(row=1, column=i, value=name)
+    cols = {n: sr.MARKET_COLUMNS.index(n) + 1 for n in sr.MARKET_COLUMNS}
+    market.cell(row=2, column=cols["Symbol"], value="AAPL")
+    market.cell(row=2, column=cols["P/E (TTM)"], value=30.0)
+    market.cell(row=2, column=cols["Forward P/E"], value=25.0)
+    market.cell(row=2, column=cols["Watchlists"], value="Berkshire, 52w highs")
+    records = sr._read_market_records_openpyxl(market)
+    assert len(records) == 1
+    assert records[0]["pe_ttm"] == 30.0
+    assert records[0]["pe_fwd"] == 25.0
+    assert records[0]["watchlists"] == "Berkshire, 52w highs"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

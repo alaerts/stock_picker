@@ -1430,32 +1430,37 @@ def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     (the script's column-name lookups depend on it) but bold + fill styling
     and column widths are left alone so user cosmetic choices survive.
     """
+    # Header styling: ALWAYS assert text + bold + fill on every column.
+    # The column-name contract is fundamental; cells that have always
+    # held their name (e.g. 'Last error' since v01) were never re-styled
+    # under the prior "only-style-on-value-rewrite" rule, leaving them
+    # bold=False while the rest of the row was bold. Always-style fixes that.
     for col_idx, name in enumerate(MARKET_COLUMNS, 1):
         cell = ws.cell(row=1, column=col_idx)
-        needs_value_write = overwrite or cell.value is None or cell.value != name
-        if needs_value_write:
+        if cell.value != name:
             cell.value = name
-            # Re-style any cell whose value we just (re)wrote — covers
-            # columns added on a schema bump that would otherwise inherit
-            # the prior cell's (or no) styling. Cells whose value already
-            # matched keep the user's cosmetic edits.
-            _bold(cell)
-            cell.fill = PatternFill("solid", fgColor="F2F2F2")
+        _bold(cell)
+        cell.fill = PatternFill("solid", fgColor="F2F2F2")
     ws.freeze_panes = "A2"
 
-    if overwrite:
-        widths = {
-            "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18,
-            "Sector": 22, "Industry": 26,
-            "Watchlists": 38, "Currency": 10,
-            "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
-            "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
-            "1D %": 9, "1W %": 9, "1M %": 9, "6M %": 9, "1Y %": 9, "5Y %": 9,
-            "P/E (TTM)": 10, "Forward P/E": 10,
-            "Description": 60, "Last update (UTC)": 20, "Last error": 30,
-        }
-        for col_idx, name in enumerate(MARKET_COLUMNS, 1):
-            ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
+    # Column widths: always apply canonical defaults. We previously gated
+    # this on "fresh creation only" to preserve user width edits, but in
+    # practice openpyxl + Excel round-trips leave Excel's auto-default
+    # values stored as if they were custom (e.g. user's 'Last error' col
+    # ended up at width=13 with no manual edit). The defaults are sensible;
+    # rerunning rebuild_inventory should give the user back a usable layout.
+    widths = {
+        "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18,
+        "Sector": 22, "Industry": 26,
+        "Watchlists": 38, "Currency": 10,
+        "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
+        "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
+        "1D %": 9, "1W %": 9, "1M %": 9, "6M %": 9, "1Y %": 9, "5Y %": 9,
+        "P/E (TTM)": 10, "Forward P/E": 10,
+        "Description": 60, "Last update (UTC)": 20, "Last error": 30,
+    }
+    for col_idx, name in enumerate(MARKET_COLUMNS, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
 
 
 def _market_col(name: str) -> int:
@@ -2608,20 +2613,18 @@ def _ensure_currencies_sheet_openpyxl(wb, fx_history: dict[str, pd.Series]) -> N
         ws = wb[CURRENCIES_SHEET_NAME]
         is_new = False
 
-    # Header — re-assert text + styling whenever a value was (re)written.
-    # Cells whose value already matches keep user-set cosmetics.
+    # Header — always re-assert text + bold + fill. Same rationale as Market.
     for col_idx, name in enumerate(CURRENCY_HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx)
-        needs_value_write = is_new or cell.value != name
-        if needs_value_write:
+        if cell.value != name:
             cell.value = name
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill("solid", fgColor="F2F2F2")
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="F2F2F2")
     if is_new:
         ws.freeze_panes = "B2"
-        ws.column_dimensions["A"].width = 12
-        for col_idx in range(2, len(CURRENCY_HEADERS) + 1):
-            ws.column_dimensions[get_column_letter(col_idx)].width = 13
+    # Column widths: always apply canonical defaults.
+    for col_idx in range(1, len(CURRENCY_HEADERS) + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 12 if col_idx == 1 else 13
 
     # Data rows
     rows = _currency_rows(fx_history)
@@ -2694,7 +2697,8 @@ def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) ->
 # rest of the existing data.
 
 RANKING_HEADERS = ["Symbol", "Name", "Owned?", "Indexes", "Sector",
-                   "Today (EUR)", "1D %", "1W %", "1M %"]
+                   "Today (EUR)", "1D %", "1W %", "1M %",
+                   "P/E (TTM)", "Forward P/E", "Watchlists"]
 MONTHLY_RANKING_TOP_N = 50
 OWNED_COL_INDEX_1BASED = RANKING_HEADERS.index("Owned?") + 1  # 3
 
@@ -2880,6 +2884,9 @@ def _ranking_row_values(m: dict) -> list:
         m.get("pct_1d"),
         m.get("pct_1w"),
         m.get("pct_1m"),
+        m.get("pe_ttm"),
+        m.get("pe_fwd"),
+        m.get("watchlists") or "",
     ]
 
 
@@ -2898,23 +2905,27 @@ def _ensure_ranking_sheet_openpyxl(wb, sheet_name: str, rows: list[dict],
         ws = wb[sheet_name]
         is_new = False
 
+    # Always re-assert header text + bold + fill, regardless of is_new.
+    # Same rationale as _layout_market_sheet — keeps the column-name
+    # contract visible at all times.
     for col_idx, name in enumerate(RANKING_HEADERS, 1):
         cell = ws.cell(row=1, column=col_idx)
-        needs_value_write = is_new or cell.value != name
-        if needs_value_write:
+        if cell.value != name:
             cell.value = name
-            # Style any header cell whose value we just (re)wrote — without
-            # this, a schema bump that adds a column ends up with one
-            # un-bold cell while the rest are bold (the 2026-05-14 I1 bug).
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill("solid", fgColor="F2F2F2")
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="F2F2F2")
+    # Column widths: always apply canonical defaults (same reasoning as Market).
+    widths = {"Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18,
+              "Sector": 22, "Today (EUR)": 12,
+              "1D %": 9, "1W %": 9, "1M %": 9,
+              "P/E (TTM)": 10, "Forward P/E": 10, "Watchlists": 38}
+    for col_idx, name in enumerate(RANKING_HEADERS, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
     if is_new:
         ws.freeze_panes = "A2"
-        widths = {"Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18,
-                  "Sector": 22, "Today (EUR)": 12,
-                  "1D %": 9, "1W %": 9, "1M %": 9}
-        for col_idx, name in enumerate(RANKING_HEADERS, 1):
-            ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(name, 12)
+
+    # Column index helpers (RANKING_HEADERS may grow over time; look up by name).
+    rcol = {n: RANKING_HEADERS.index(n) + 1 for n in RANKING_HEADERS}
 
     # Clear prior data rows; write new ones.
     for r in range(2, ws.max_row + 1):
@@ -2927,15 +2938,16 @@ def _ensure_ranking_sheet_openpyxl(wb, sheet_name: str, rows: list[dict],
         sym_cell.hyperlink = yahoo_quote_url(sym)
         sym_cell.style = "Hyperlink"
         values = _ranking_row_values(m)
-        ws.cell(row=row, column=2, value=values[1])
-        ws.cell(row=row, column=3, value=values[2])
-        ws.cell(row=row, column=4, value=values[3])
-        ws.cell(row=row, column=5, value=values[4])
-        c6 = ws.cell(row=row, column=6, value=values[5])
-        c6.number_format = COMMA_STYLE
-        for pct_col_idx, val in ((7, values[6]), (8, values[7]), (9, values[8])):
-            cell = ws.cell(row=row, column=pct_col_idx, value=val)
-            cell.number_format = PERCENT_STYLE
+        # Write each remaining column by name → tolerant of future
+        # column additions without reordering bugs.
+        for col_idx, name in enumerate(RANKING_HEADERS, 1):
+            if col_idx == 1:
+                continue  # Symbol already written + hyperlinked above
+            cell = ws.cell(row=row, column=col_idx, value=values[col_idx - 1])
+            if name == "Today (EUR)" or name == "P/E (TTM)" or name == "Forward P/E":
+                cell.number_format = COMMA_STYLE
+            elif name in ("1D %", "1W %", "1M %"):
+                cell.number_format = PERCENT_STYLE
 
     # AutoFilter on the data range, with optional pre-set Owned?=Yes filter.
     last_col_letter = get_column_letter(len(RANKING_HEADERS))
@@ -2974,8 +2986,15 @@ def _ensure_ranking_sheet_xlwings(wb_xw, sheet_name: str, rows: list[dict],
         bulk = [_ranking_row_values(m) for m in rows]
         sh.range((2, 1)).value = bulk
         last_row = 1 + len(rows)
-        sh.range(f"F2:F{last_row}").api.NumberFormat = COMMA_STYLE
-        sh.range(f"G2:I{last_row}").api.NumberFormat = PERCENT_STYLE
+        # Apply number formats column by column rather than by hardcoded
+        # letters — survives future RANKING_HEADERS additions.
+        for col_idx, name in enumerate(RANKING_HEADERS, 1):
+            letter = get_column_letter(col_idx)
+            rng = sh.range(f"{letter}2:{letter}{last_row}")
+            if name in ("Today (EUR)", "P/E (TTM)", "Forward P/E"):
+                rng.api.NumberFormat = COMMA_STYLE
+            elif name in ("1D %", "1W %", "1M %"):
+                rng.api.NumberFormat = PERCENT_STYLE
         # Hyperlink each Symbol cell
         for offset, m in enumerate(rows):
             cell = sh.range((2 + offset, 1))
@@ -3027,15 +3046,18 @@ def _read_market_records_openpyxl(market_ws) -> list[dict]:
         if not sym:
             continue
         out.append({
-            "symbol":  str(sym),
-            "name":    market_ws.cell(row=r, column=cols["Name"]).value,
-            "owned":   market_ws.cell(row=r, column=cols["Owned?"]).value,
-            "indexes": market_ws.cell(row=r, column=cols["Indexes"]).value,
-            "sector":  market_ws.cell(row=r, column=cols["Sector"]).value,
-            "today":   market_ws.cell(row=r, column=cols["Today (EUR)"]).value,
-            "pct_1d":  market_ws.cell(row=r, column=cols["1D %"]).value,
-            "pct_1w":  market_ws.cell(row=r, column=cols["1W %"]).value,
-            "pct_1m":  market_ws.cell(row=r, column=cols["1M %"]).value,
+            "symbol":     str(sym),
+            "name":       market_ws.cell(row=r, column=cols["Name"]).value,
+            "owned":      market_ws.cell(row=r, column=cols["Owned?"]).value,
+            "indexes":    market_ws.cell(row=r, column=cols["Indexes"]).value,
+            "sector":     market_ws.cell(row=r, column=cols["Sector"]).value,
+            "today":      market_ws.cell(row=r, column=cols["Today (EUR)"]).value,
+            "pct_1d":     market_ws.cell(row=r, column=cols["1D %"]).value,
+            "pct_1w":     market_ws.cell(row=r, column=cols["1W %"]).value,
+            "pct_1m":     market_ws.cell(row=r, column=cols["1M %"]).value,
+            "pe_ttm":     market_ws.cell(row=r, column=cols["P/E (TTM)"]).value,
+            "pe_fwd":     market_ws.cell(row=r, column=cols["Forward P/E"]).value,
+            "watchlists": market_ws.cell(row=r, column=cols["Watchlists"]).value,
         })
     return out
 
@@ -3059,15 +3081,18 @@ def _read_market_records_xlwings(market_xw) -> list[dict]:
         if not sym:
             continue
         out.append({
-            "symbol":  str(sym),
-            "name":    row_vals[cols["Name"] - 1],
-            "owned":   row_vals[cols["Owned?"] - 1],
-            "indexes": row_vals[cols["Indexes"] - 1],
-            "sector":  row_vals[cols["Sector"] - 1],
-            "today":   row_vals[cols["Today (EUR)"] - 1],
-            "pct_1d":  row_vals[cols["1D %"] - 1],
-            "pct_1w":  row_vals[cols["1W %"] - 1],
-            "pct_1m":  row_vals[cols["1M %"] - 1],
+            "symbol":     str(sym),
+            "name":       row_vals[cols["Name"] - 1],
+            "owned":      row_vals[cols["Owned?"] - 1],
+            "indexes":    row_vals[cols["Indexes"] - 1],
+            "sector":     row_vals[cols["Sector"] - 1],
+            "today":      row_vals[cols["Today (EUR)"] - 1],
+            "pct_1d":     row_vals[cols["1D %"] - 1],
+            "pct_1w":     row_vals[cols["1W %"] - 1],
+            "pct_1m":     row_vals[cols["1M %"] - 1],
+            "pe_ttm":     row_vals[cols["P/E (TTM)"] - 1],
+            "pe_fwd":     row_vals[cols["Forward P/E"] - 1],
+            "watchlists": row_vals[cols["Watchlists"] - 1],
         })
     return out
 
