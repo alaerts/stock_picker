@@ -662,7 +662,7 @@ def test_fetch_all_info_should_stop_breaks_early(monkeypatch):
     """should_stop callback short-circuits the loop. Returns partial dict —
     len(out) < len(tickers) signals the caller that the run was interrupted."""
     import stocks_report as sr
-    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {"longName": t})
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t, session=None: {"longName": t})
     monkeypatch.setattr(sr.time, "sleep", lambda s: None)
     tickers = [f"T{i}" for i in range(100)]
     # Stop after the first poll (at i==1).
@@ -672,7 +672,7 @@ def test_fetch_all_info_should_stop_breaks_early(monkeypatch):
 
 def test_fetch_all_info_should_stop_lets_loop_finish_when_false(monkeypatch):
     import stocks_report as sr
-    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {"longName": t})
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t, session=None: {"longName": t})
     monkeypatch.setattr(sr.time, "sleep", lambda s: None)
     tickers = [f"T{i}" for i in range(50)]
     out = sr.fetch_all_info(tickers, delay=0.0, should_stop=lambda: False)
@@ -695,7 +695,7 @@ def test_resolve_or_adopt_clears_error_when_symbol_already_in_market(monkeypatch
     clears any stale error from a previous run."""
     import stocks_report as sr
     monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption",
-                        lambda s: pytest.fail("must not query Yahoo for resolved symbol"))
+                        lambda s, session=None: pytest.fail("must not query Yahoo for resolved symbol"))
     constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
     written: list[tuple[int, object]] = []
     out = sr.resolve_or_adopt_portfolio(
@@ -710,7 +710,7 @@ def test_resolve_or_adopt_adopts_when_yahoo_knows_ticker(monkeypatch):
     Indexes='Portfolio'; error is cleared."""
     import stocks_report as sr
     monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption",
-                        lambda s: {"Name": f"Long {s}", "currency": "EUR"})
+                        lambda s, session=None: {"Name": f"Long {s}", "currency": "EUR"})
     constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
     written: list[tuple[int, object]] = []
     out = sr.resolve_or_adopt_portfolio(
@@ -727,7 +727,7 @@ def test_resolve_or_adopt_writes_error_when_yahoo_fails(monkeypatch):
     """An unresolved symbol that Yahoo can't find: error written to row,
     constituents unchanged, no raise."""
     import stocks_report as sr
-    monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption", lambda s: None)
+    monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption", lambda s, session=None: None)
     constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
     written: list[tuple[int, object]] = []
     out = sr.resolve_or_adopt_portfolio(
@@ -752,7 +752,7 @@ def test_resolve_or_adopt_does_not_double_adopt_same_ticker(monkeypatch):
     synthetic constituent, not two."""
     import stocks_report as sr
     monkeypatch.setattr(sr, "_yahoo_lookup_for_adoption",
-                        lambda s: {"Name": s, "currency": ""})
+                        lambda s, session=None: {"Name": s, "currency": ""})
     constituents = pd.DataFrame([{"Symbol": "AAPL", "Name": "Apple", "Indexes": "SP500"}])
     out = sr.resolve_or_adopt_portfolio(
         [(16, "FOO.X"), (17, "FOO.X")], constituents, lambda r, m: None,
@@ -1290,7 +1290,8 @@ def test_fetch_all_info_parallel_returns_all_results(monkeypatch):
     """Speedup A: with ThreadPoolExecutor, every ticker still ends up in
     the result dict regardless of completion order."""
     import stocks_report as sr
-    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {"longName": t, "sector": "X"})
+    monkeypatch.setattr(sr, "fetch_ticker_info",
+                        lambda t, session=None: {"longName": t, "sector": "X"})
     tickers = [f"T{i}" for i in range(75)]
     out = sr.fetch_all_info(tickers, max_workers=8)
     assert set(out.keys()) == set(tickers)
@@ -1301,7 +1302,7 @@ def test_fetch_all_info_progress_fires_per_completion(monkeypatch):
     """Speedup A: progress callback fires for each completed ticker — used
     by the workbook Status cell to show live counts."""
     import stocks_report as sr
-    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t: {})
+    monkeypatch.setattr(sr, "fetch_ticker_info", lambda t, session=None: {})
     seen: list[int] = []
     sr.fetch_all_info(
         [f"T{i}" for i in range(20)],
@@ -1374,7 +1375,7 @@ def test_fetch_all_info_with_cache_uses_cache(tmp_path, monkeypatch):
     finally:
         cache.close()
     call_log: list[str] = []
-    def fake_fetch(t):
+    def fake_fetch(t, session=None):
         call_log.append(t)
         return {"currency": "??", "longName": f"FRESH-{t}"}
     monkeypatch.setattr(sr, "fetch_ticker_info", fake_fetch)
@@ -1392,12 +1393,12 @@ def test_fetch_all_info_with_cache_persists_misses(tmp_path, monkeypatch):
     """Speedup F: fresh fetches get persisted so the next call hits cache."""
     import stocks_report as sr
     monkeypatch.setattr(sr, "fetch_ticker_info",
-                        lambda t: {"longName": f"persisted-{t}"})
+                        lambda t, session=None: {"longName": f"persisted-{t}"})
     cache_path = tmp_path / "cache.sqlite"
     sr.fetch_all_info_with_cache(["A", "B"], cache_path=cache_path, ttl_seconds=86400)
     # Second call should be a 100% cache hit; fetch_ticker_info MUST NOT fire.
     monkeypatch.setattr(sr, "fetch_ticker_info",
-                        lambda t: pytest.fail(f"unexpected fetch of {t}"))
+                        lambda t, session=None: pytest.fail(f"unexpected fetch of {t}"))
     info_map, hits = sr.fetch_all_info_with_cache(
         ["A", "B"], cache_path=cache_path, ttl_seconds=86400,
     )
@@ -1413,6 +1414,197 @@ def test_info_cache_path_lives_next_to_workbook(tmp_path):
     wb.parent.mkdir(parents=True)
     assert sr._info_cache_path_for(wb).parent == wb.parent
     assert sr._info_cache_path_for(None).is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# Batch 1 speedups: shared Yahoo session, retry-on-401, parallel watchlists + prices
+# ---------------------------------------------------------------------------
+
+def test_fetch_ticker_info_retries_when_first_call_returns_empty(monkeypatch):
+    """Symptom of a transient 401 Invalid Crumb is t.info returning {} —
+    we retry once before accepting that result."""
+    import stocks_report as sr
+    calls = {"n": 0}
+
+    class _FakeTicker:
+        def __init__(self, sym, session=None): self.sym = sym
+        @property
+        def info(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {}  # simulate 401 → empty
+            return {"longName": "Apple Inc.", "currency": "USD",
+                    "trailingPE": 30.0, "forwardPE": 25.0,
+                    "sector": "Technology", "longBusinessSummary": "Phones"}
+
+    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
+    monkeypatch.setattr(sr.time, "sleep", lambda s: None)
+    out = sr.fetch_ticker_info("AAPL")
+    assert calls["n"] == 2, "should have retried once on empty"
+    assert out["longName"] == "Apple Inc."
+    assert out["trailingPE"] == 30.0
+
+
+def test_fetch_ticker_info_no_retry_when_first_call_has_data(monkeypatch):
+    """Successful first call must NOT trigger a retry — keep the latency
+    overhead off the hot path."""
+    import stocks_report as sr
+    calls = {"n": 0}
+
+    class _FakeTicker:
+        def __init__(self, sym, session=None): pass
+        @property
+        def info(self):
+            calls["n"] += 1
+            return {"longName": "X", "currency": "EUR"}
+
+    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
+    sr.fetch_ticker_info("X")
+    assert calls["n"] == 1
+
+
+def test_fetch_ticker_info_accepts_empty_after_retry(monkeypatch):
+    """Delisted/invalid tickers return empty even on retry — we accept that
+    rather than spinning forever."""
+    import stocks_report as sr
+
+    class _FakeTicker:
+        def __init__(self, sym, session=None): pass
+        @property
+        def info(self): return {}
+
+    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
+    monkeypatch.setattr(sr.time, "sleep", lambda s: None)
+    out = sr.fetch_ticker_info("DEADTKR")
+    # All fields default to empty/None — no crash.
+    assert out["longName"] == ""
+    assert out["trailingPE"] is None
+
+
+def test_fetch_all_info_passes_session_to_ticker(monkeypatch):
+    """The shared session must reach the underlying yf.Ticker constructor —
+    otherwise the 401 fix is defeated."""
+    import stocks_report as sr
+    seen_sessions: list = []
+
+    class _FakeTicker:
+        def __init__(self, sym, session=None):
+            seen_sessions.append(session)
+        @property
+        def info(self):
+            return {"longName": "ok", "currency": "USD"}
+
+    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
+    # Skip the real cookie warmup
+    monkeypatch.setattr(sr, "get_yahoo_session", lambda: "SHARED_SENTINEL")
+    sr.fetch_all_info(["A", "B", "C"], max_workers=2)
+    # Every fetch_ticker_info call should have received the shared session.
+    assert seen_sessions and all(s == "SHARED_SENTINEL" for s in seen_sessions)
+
+
+def test_fetch_close_prices_runs_chunks_in_parallel(monkeypatch):
+    """Speedup: at least 2 chunks should be in flight at the same time."""
+    import stocks_report as sr
+    in_flight = {"max": 0, "current": 0}
+    lock = __import__("threading").Lock()
+
+    def fake_download(tickers, start, end, **kw):
+        with lock:
+            in_flight["current"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["current"])
+        import time as _t
+        _t.sleep(0.1)
+        with lock:
+            in_flight["current"] -= 1
+        # Build a multi-ticker close DataFrame so the slicing path works
+        idx = pd.date_range("2026-05-01", periods=3, freq="D")
+        df = pd.DataFrame({t: [1.0, 2.0, 3.0] for t in tickers}, index=idx)
+        return pd.concat({"Close": df}, axis=1)  # MultiIndex columns
+
+    monkeypatch.setattr(sr.yf, "download", fake_download)
+    tickers = [f"T{i}" for i in range(30)]
+    out = sr.fetch_close_prices(tickers, dt.date(2026, 5, 1), dt.date(2026, 5, 4),
+                                chunk_size=10, max_workers=4)
+    assert in_flight["max"] >= 2, "should have overlapped chunks"
+    assert not out.empty
+
+
+def test_fetch_close_prices_passes_session(monkeypatch):
+    """Shared session flows into yf.download so the chunk fetcher reuses cookies."""
+    import stocks_report as sr
+    seen = {"sessions": []}
+
+    def fake_download(tickers, start, end, **kw):
+        seen["sessions"].append(kw.get("session"))
+        idx = pd.date_range("2026-05-01", periods=2, freq="D")
+        df = pd.DataFrame({t: [1.0, 2.0] for t in tickers}, index=idx)
+        return pd.concat({"Close": df}, axis=1)
+
+    monkeypatch.setattr(sr.yf, "download", fake_download)
+    sentinel = object()
+    sr.fetch_close_prices(["A", "B", "C", "D"], dt.date(2026, 5, 1), dt.date(2026, 5, 3),
+                          chunk_size=2, max_workers=2, session=sentinel)
+    assert all(s is sentinel for s in seen["sessions"])
+
+
+def test_fetch_all_watchlists_runs_in_parallel(monkeypatch):
+    """The 6 watchlists should fire concurrently, not serially."""
+    import stocks_report as sr
+    in_flight = {"max": 0, "current": 0}
+    lock = __import__("threading").Lock()
+
+    def slow_screener(scrid, sess, crumb):
+        with lock:
+            in_flight["current"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["current"])
+        import time as _t
+        _t.sleep(0.05)
+        with lock:
+            in_flight["current"] -= 1
+        return {scrid.upper()}
+
+    def slow_dataroma(path):
+        with lock:
+            in_flight["current"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["current"])
+        import time as _t
+        _t.sleep(0.05)
+        with lock:
+            in_flight["current"] -= 1
+        return {"DR-" + path[-3:]}
+
+    def slow_activists():
+        with lock:
+            in_flight["current"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["current"])
+        import time as _t
+        _t.sleep(0.05)
+        with lock:
+            in_flight["current"] -= 1
+        return {"ACT"}
+
+    monkeypatch.setattr(sr, "_yahoo_screener_session",
+                        lambda: (object(), "crumb"))
+    monkeypatch.setattr(sr, "fetch_yahoo_screener", slow_screener)
+    monkeypatch.setattr(sr, "fetch_dataroma_tickers", slow_dataroma)
+    monkeypatch.setattr(sr, "fetch_dataroma_activist_aggregate", slow_activists)
+    out = sr.fetch_all_watchlists(max_workers=6)
+    assert in_flight["max"] >= 2, "watchlists must overlap"
+    assert out  # something landed
+
+
+def test_get_yahoo_session_returns_session_even_on_warmup_failure(monkeypatch):
+    """Network failure during cookie seeding must not crash the run — we
+    return a usable session anyway. yfinance will retry the auth itself."""
+    import stocks_report as sr
+
+    class _BoomSession:
+        def __init__(self): self.headers = {}
+        def get(self, *a, **kw): raise RuntimeError("network down")
+
+    monkeypatch.setattr(sr.requests, "Session", _BoomSession)
+    s = sr.get_yahoo_session()
+    assert s is not None
 
 
 if __name__ == "__main__":
