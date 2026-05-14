@@ -1481,27 +1481,6 @@ def test_fetch_ticker_info_accepts_empty_after_retry(monkeypatch):
     assert out["trailingPE"] is None
 
 
-def test_fetch_all_info_passes_session_to_ticker(monkeypatch):
-    """The shared session must reach the underlying yf.Ticker constructor —
-    otherwise the 401 fix is defeated."""
-    import stocks_report as sr
-    seen_sessions: list = []
-
-    class _FakeTicker:
-        def __init__(self, sym, session=None):
-            seen_sessions.append(session)
-        @property
-        def info(self):
-            return {"longName": "ok", "currency": "USD"}
-
-    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
-    # Skip the real cookie warmup
-    monkeypatch.setattr(sr, "get_yahoo_session", lambda: "SHARED_SENTINEL")
-    sr.fetch_all_info(["A", "B", "C"], max_workers=2)
-    # Every fetch_ticker_info call should have received the shared session.
-    assert seen_sessions and all(s == "SHARED_SENTINEL" for s in seen_sessions)
-
-
 def test_fetch_close_prices_runs_chunks_in_parallel(monkeypatch):
     """Speedup: at least 2 chunks should be in flight at the same time."""
     import stocks_report as sr
@@ -1527,24 +1506,6 @@ def test_fetch_close_prices_runs_chunks_in_parallel(monkeypatch):
                                 chunk_size=10, max_workers=4)
     assert in_flight["max"] >= 2, "should have overlapped chunks"
     assert not out.empty
-
-
-def test_fetch_close_prices_passes_session(monkeypatch):
-    """Shared session flows into yf.download so the chunk fetcher reuses cookies."""
-    import stocks_report as sr
-    seen = {"sessions": []}
-
-    def fake_download(tickers, start, end, **kw):
-        seen["sessions"].append(kw.get("session"))
-        idx = pd.date_range("2026-05-01", periods=2, freq="D")
-        df = pd.DataFrame({t: [1.0, 2.0] for t in tickers}, index=idx)
-        return pd.concat({"Close": df}, axis=1)
-
-    monkeypatch.setattr(sr.yf, "download", fake_download)
-    sentinel = object()
-    sr.fetch_close_prices(["A", "B", "C", "D"], dt.date(2026, 5, 1), dt.date(2026, 5, 3),
-                          chunk_size=2, max_workers=2, session=sentinel)
-    assert all(s is sentinel for s in seen["sessions"])
 
 
 def test_fetch_all_watchlists_runs_in_parallel(monkeypatch):
@@ -1593,18 +1554,121 @@ def test_fetch_all_watchlists_runs_in_parallel(monkeypatch):
     assert out  # something landed
 
 
-def test_get_yahoo_session_returns_session_even_on_warmup_failure(monkeypatch):
-    """Network failure during cookie seeding must not crash the run — we
-    return a usable session anyway. yfinance will retry the auth itself."""
+# ---------------------------------------------------------------------------
+# v04: Industry column + Market layout validation
+# ---------------------------------------------------------------------------
+
+def test_market_columns_includes_industry():
+    """Industry must sit between Sector and Watchlists per the layout contract."""
+    import stocks_report as sr
+    sec = sr.MARKET_COLUMNS.index("Sector")
+    ind = sr.MARKET_COLUMNS.index("Industry")
+    wl  = sr.MARKET_COLUMNS.index("Watchlists")
+    assert sec + 1 == ind, "Industry must come right after Sector"
+    assert ind + 1 == wl,  "Watchlists must come right after Industry"
+
+
+def test_fetch_ticker_info_returns_industry(monkeypatch):
+    """fetch_ticker_info surfaces yfinance .info['industry']."""
     import stocks_report as sr
 
-    class _BoomSession:
-        def __init__(self): self.headers = {}
-        def get(self, *a, **kw): raise RuntimeError("network down")
+    class _FakeTicker:
+        def __init__(self, sym): pass
+        @property
+        def info(self):
+            return {"longName": "Apple Inc.", "currency": "USD",
+                    "sector": "Technology", "industry": "Consumer Electronics"}
 
-    monkeypatch.setattr(sr.requests, "Session", _BoomSession)
-    s = sr.get_yahoo_session()
-    assert s is not None
+    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
+    out = sr.fetch_ticker_info("AAPL")
+    assert out["industry"] == "Consumer Electronics"
+    assert out["sector"] == "Technology"
+
+
+def test_fetch_ticker_info_missing_industry_is_empty_string(monkeypatch):
+    """If yfinance doesn't return industry, the field defaults to ''."""
+    import stocks_report as sr
+
+    class _FakeTicker:
+        def __init__(self, sym): pass
+        @property
+        def info(self):
+            return {"longName": "X", "currency": "EUR"}  # no industry
+
+    monkeypatch.setattr(sr.yf, "Ticker", _FakeTicker)
+    out = sr.fetch_ticker_info("X")
+    assert out["industry"] == ""
+
+
+def test_info_cache_roundtrip_includes_industry(tmp_path):
+    """Speedup F cache persists the industry field across runs."""
+    import stocks_report as sr
+    cache = sr.InfoCache(tmp_path / "cache.sqlite")
+    try:
+        cache.put_many({
+            "AAPL": {"currency": "USD", "trailingPE": 30.0, "forwardPE": 25.0,
+                     "longName": "Apple", "sector": "Technology",
+                     "industry": "Consumer Electronics", "description": ""},
+        })
+        got = cache.get_fresh(["AAPL"], ttl_seconds=86400)
+    finally:
+        cache.close()
+    assert got["AAPL"]["industry"] == "Consumer Electronics"
+
+
+def test_info_cache_handles_legacy_db_without_industry_column(tmp_path):
+    """Pre-v04 cache files don't have the industry column. The migration
+    must add it on the next open, and get_fresh must tolerate NULL values."""
+    import sqlite3
+    db = tmp_path / "legacy.sqlite"
+    # Simulate an old (pre-v04) cache.
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE info_cache (ticker TEXT PRIMARY KEY, currency TEXT, "
+                 "trailing_pe REAL, forward_pe REAL, long_name TEXT, sector TEXT, "
+                 "description TEXT, fetched_at REAL NOT NULL)")
+    conn.execute("INSERT INTO info_cache VALUES ('AAPL', 'USD', 30.0, 25.0, "
+                 "'Apple', 'Technology', '', ?)", [__import__("time").time()])
+    conn.commit()
+    conn.close()
+    # Open via InfoCache — migration should ALTER TABLE to add industry.
+    import stocks_report as sr
+    cache = sr.InfoCache(db)
+    try:
+        out = cache.get_fresh(["AAPL"], ttl_seconds=86400)
+    finally:
+        cache.close()
+    assert out["AAPL"]["industry"] == ""  # NULL → empty string
+
+
+def test_check_market_headers_passes_on_canonical_layout():
+    """When the workbook's header row exactly matches MARKET_COLUMNS, no error."""
+    import stocks_report as sr
+    assert sr._check_market_headers(list(sr.MARKET_COLUMNS)) is None
+
+
+def test_check_market_headers_fails_on_pre_v04_layout():
+    """A pre-v04 header row (no Industry) must surface a specific error
+    mentioning the actual vs expected column name."""
+    import stocks_report as sr
+    pre_v04 = [c for c in sr.MARKET_COLUMNS if c != "Industry"]
+    err = sr._check_market_headers(pre_v04)
+    assert err is not None
+    assert "Industry" in err
+    assert "rebuild-inventory" in err
+
+
+def test_currencies_sheet_openpyxl_applies_autofilter(tmp_path):
+    """The Currencies sheet must end up with an AutoFilter spanning the data."""
+    from openpyxl import Workbook
+    import stocks_report as sr
+    wb = Workbook()
+    # Stub a tiny fx_history: one pair, one date.
+    idx = pd.date_range("2026-05-13", periods=1, freq="D")
+    fx_history = {"USD": pd.Series([1.10], index=idx)}
+    sr._ensure_currencies_sheet_openpyxl(wb, fx_history)
+    ws = wb[sr.CURRENCIES_SHEET_NAME]
+    assert ws.auto_filter.ref is not None
+    assert ws.auto_filter.ref.startswith("A1:")
 
 
 if __name__ == "__main__":

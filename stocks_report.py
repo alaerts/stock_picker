@@ -405,27 +405,17 @@ _SCREENER_PAGE_STEP = 5    # observed per-call cap
 _SCREENER_MAX_RECORDS = 250  # safety stop per screener
 
 
-def get_yahoo_session() -> requests.Session:
-    """Return a shared ``requests.Session`` with Yahoo's consent cookies seeded.
-
-    Pass into ``yf.Ticker(sym, session=...)`` (and friends) so every parallel
-    worker shares ONE cookie jar instead of negotiating its own. This is the
-    structural fix for the HTTP 401 "Invalid Crumb" bursts that per-Ticker
-    independent sessions produce under concurrent .info load — yfinance
-    detects the existing A1/A3 consent cookies on this jar and reuses them
-    instead of racing on a fresh negotiation per worker.
-    """
-    s = requests.Session()
-    s.headers.update(HTTP_HEADERS)
-    try:
-        # fc.yahoo.com sets A1/A3 consent. Hitting the finance.yahoo.com
-        # root afterwards locks in the GUCS cookie that the /v7 quoteSummary
-        # endpoint demands alongside a valid crumb.
-        s.get("https://fc.yahoo.com", timeout=10)
-        s.get("https://finance.yahoo.com/", timeout=10)
-    except Exception as e:
-        log.debug(f"get_yahoo_session warmup failed (continuing anyway): {e}")
-    return s
+# Note: we previously tried passing a shared requests.Session into yfinance
+# calls to fix HTTP 401 "Invalid Crumb" bursts under parallel load. That
+# approach FAILS — yfinance 0.2.x raises YFDataException demanding a
+# curl_cffi session (TLS fingerprinting + browser-like behaviour). The
+# fix the yfinance maintainers recommend is the OPPOSITE of what we did:
+# "stop setting session, let YF handle." Yfinance manages its own
+# curl_cffi session internally with crumb caching that's threadsafe
+# enough — the 401s we observed are mostly retried by yfinance itself
+# (visible as ERROR logs but invisible at the result level: 982 ok / 0
+# failed). What does help is retry-on-empty in fetch_ticker_info to
+# rescue the rare case where yfinance does give up.
 
 
 def _yahoo_screener_session() -> Optional[tuple[requests.Session, str]]:
@@ -660,8 +650,7 @@ def to_eur(price: float, currency: str, fx: dict[str, float]) -> Optional[float]
 
 def fetch_close_prices(tickers: list[str], start: dt.date, end: dt.date,
                        chunk_size: int = 80,
-                       max_workers: int = 6,
-                       session: Optional[requests.Session] = None) -> pd.DataFrame:
+                       max_workers: int = 6) -> pd.DataFrame:
     """Returns a wide DataFrame of close prices: date index, ticker columns.
 
     Speedup: chunks are downloaded in parallel via ``ThreadPoolExecutor``.
@@ -669,6 +658,9 @@ def fetch_close_prices(tickers: list[str], start: dt.date, end: dt.date,
     new concurrency cap. ``yf.download`` is called with ``threads=False``
     because we're doing our own threading at the chunk level — yfinance's
     own per-ticker threading would oversubscribe.
+
+    No ``session`` argument: yfinance 0.2.x requires its own curl_cffi
+    session (TLS fingerprinting), so we let yfinance manage it.
     """
     log.info(f"Downloading price history for {len(tickers)} tickers ({start} → {end}, "
              f"parallel workers={max_workers})")
@@ -676,13 +668,11 @@ def fetch_close_prices(tickers: list[str], start: dt.date, end: dt.date,
 
     def _fetch_chunk(idx: int, chunk: list[str]) -> Optional[pd.DataFrame]:
         try:
-            kwargs = {
-                "progress": False, "auto_adjust": False,
-                "group_by": "column", "threads": False,
-            }
-            if session is not None:
-                kwargs["session"] = session
-            df = yf.download(chunk, start=start, end=end, **kwargs)
+            df = yf.download(
+                chunk, start=start, end=end,
+                progress=False, auto_adjust=False,
+                group_by="column", threads=False,
+            )
         except Exception as e:
             log.warning(f"  Price chunk {idx} failed: {e}")
             return None
@@ -714,25 +704,20 @@ def fetch_close_prices(tickers: list[str], start: dt.date, end: dt.date,
     combined = combined.loc[:, ~combined.columns.duplicated()]
     return combined
 
-def fetch_ticker_info(ticker: str, session: Optional[requests.Session] = None) -> dict:
-    """Returns currency, P/E, name, sector, and business description. Best-effort.
+def fetch_ticker_info(ticker: str) -> dict:
+    """Returns currency, P/E, name, sector, industry, and business description. Best-effort.
 
-    All fields come from a single ``yf.Ticker(t).info`` call, so adding sector
-    and description has zero extra cost over fetching P/E.
-
-    ``session`` is the shared Yahoo session from ``get_yahoo_session()`` —
-    avoids per-Ticker cookie/crumb races under concurrent .info load.
+    All fields come from a single ``yf.Ticker(t).info`` call.
 
     Retry-on-empty: if the first call returns ``{}`` (the symptom of a
-    transient 401 Invalid Crumb), we sleep briefly and retry once before
-    accepting the empty result. Truly delisted tickers also return empty;
-    the extra retry costs ~0.3s per such case but rescues the much more
-    common case of an auth blip.
+    transient 401 Invalid Crumb that yfinance gave up on), we sleep briefly
+    and retry once. Truly delisted tickers also return empty; the extra
+    retry costs ~0.3s per such case but rescues the much more common case
+    of an auth blip.
     """
     def _one_call() -> dict:
         try:
-            t = yf.Ticker(ticker, session=session) if session is not None else yf.Ticker(ticker)
-            return t.info or {}
+            return yf.Ticker(ticker).info or {}
         except Exception as e:
             log.debug(f"info('{ticker}') raised: {e}")
             return {}
@@ -747,6 +732,7 @@ def fetch_ticker_info(ticker: str, session: Optional[requests.Session] = None) -
         "forwardPE":   info.get("forwardPE"),
         "longName":    info.get("longName") or info.get("shortName") or "",
         "sector":      info.get("sector") or "",
+        "industry":    info.get("industry") or "",
         "description": info.get("longBusinessSummary") or "",
     }
 
@@ -754,8 +740,7 @@ def fetch_all_info(tickers: list[str], delay: float = 0.0,
                    progress: Optional[Callable[[int, int, str], None]] = None,
                    should_stop: Optional[Callable[[], bool]] = None,
                    stop_poll_every: int = 25,
-                   max_workers: int = 8,
-                   session: Optional[requests.Session] = None) -> dict[str, dict]:
+                   max_workers: int = 8) -> dict[str, dict]:
     """Fetch yfinance .info for each ticker, in parallel.
 
     Speedup A: uses ``ThreadPoolExecutor`` with ``max_workers`` concurrent
@@ -765,9 +750,6 @@ def fetch_all_info(tickers: list[str], delay: float = 0.0,
     The ``delay`` arg is kept for backward compatibility with tests but is
     no longer applied between requests; the concurrency cap is the new
     rate-limiter.
-
-    ``session`` is the shared Yahoo session. If not provided, one is created
-    via ``get_yahoo_session()`` so concurrent workers don't race on cookies.
 
     Optional callbacks:
       - ``progress(done, total, current_symbol)`` invoked as each ticker
@@ -779,13 +761,11 @@ def fetch_all_info(tickers: list[str], delay: float = 0.0,
     """
     del delay  # kept in signature for callers/tests; no longer used
     total = len(tickers)
-    if session is None:
-        session = get_yahoo_session()
     log.info(f"Fetching .info for {total} tickers (parallel, workers={max_workers})")
     out: dict[str, dict] = {}
     stopped = False
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_ticker = {ex.submit(fetch_ticker_info, t, session): t for t in tickers}
+        future_to_ticker = {ex.submit(fetch_ticker_info, t): t for t in tickers}
         done = 0
         for fut in as_completed(future_to_ticker):
             t = future_to_ticker[fut]
@@ -795,7 +775,7 @@ def fetch_all_info(tickers: list[str], delay: float = 0.0,
                 log.debug(f"info('{t}') raised in worker: {e}")
                 out[t] = {
                     "currency": "", "trailingPE": None, "forwardPE": None,
-                    "longName": "", "sector": "", "description": "",
+                    "longName": "", "sector": "", "industry": "", "description": "",
                 }
             done += 1
             if done % 50 == 0 or done == 1:
@@ -838,9 +818,15 @@ class InfoCache:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS info_cache ("
             "ticker TEXT PRIMARY KEY, currency TEXT, trailing_pe REAL, "
-            "forward_pe REAL, long_name TEXT, sector TEXT, description TEXT, "
-            "fetched_at REAL NOT NULL)"
+            "forward_pe REAL, long_name TEXT, sector TEXT, industry TEXT, "
+            "description TEXT, fetched_at REAL NOT NULL)"
         )
+        # Lightweight migration: older caches predate the industry column.
+        try:
+            self._conn.execute("ALTER TABLE info_cache ADD COLUMN industry TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._conn.commit()
 
     def get_fresh(self, tickers: list[str], ttl_seconds: float) -> dict[str, dict]:
@@ -849,18 +835,19 @@ class InfoCache:
         cutoff = time.time() - ttl_seconds
         placeholders = ",".join("?" * len(tickers))
         cur = self._conn.execute(
-            f"SELECT ticker, currency, trailing_pe, forward_pe, long_name, sector, description "
+            f"SELECT ticker, currency, trailing_pe, forward_pe, long_name, sector, industry, description "
             f"FROM info_cache WHERE fetched_at >= ? AND ticker IN ({placeholders})",
             [cutoff, *tickers],
         )
         out: dict[str, dict] = {}
-        for t, ccy, tpe, fpe, ln, sec, desc in cur.fetchall():
+        for t, ccy, tpe, fpe, ln, sec, ind, desc in cur.fetchall():
             out[t] = {
                 "currency": ccy or "",
                 "trailingPE": tpe,
                 "forwardPE": fpe,
                 "longName": ln or "",
                 "sector": sec or "",
+                "industry": ind or "",
                 "description": desc or "",
             }
         return out
@@ -877,6 +864,7 @@ class InfoCache:
                 d.get("forwardPE"),
                 (d.get("longName") or ""),
                 (d.get("sector") or ""),
+                (d.get("industry") or ""),
                 (d.get("description") or ""),
                 now,
             )
@@ -884,7 +872,7 @@ class InfoCache:
         ]
         self._conn.executemany(
             "INSERT OR REPLACE INTO info_cache (ticker, currency, trailing_pe, forward_pe, "
-            "long_name, sector, description, fetched_at) VALUES (?,?,?,?,?,?,?,?)",
+            "long_name, sector, industry, description, fetched_at) VALUES (?,?,?,?,?,?,?,?,?)",
             rows,
         )
         self._conn.commit()
@@ -903,7 +891,6 @@ def fetch_all_info_with_cache(
     progress: Optional[Callable[[int, int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     max_workers: int = 8,
-    session: Optional[requests.Session] = None,
 ) -> tuple[dict[str, dict], int]:
     """Speedup F wrapper around ``fetch_all_info`` — returns ``(info_map, cached_count)``.
 
@@ -921,7 +908,7 @@ def fetch_all_info_with_cache(
         if misses:
             fresh = fetch_all_info(
                 misses, progress=progress, should_stop=should_stop,
-                max_workers=max_workers, session=session,
+                max_workers=max_workers,
             )
             cache.put_many(fresh)
         else:
@@ -1053,6 +1040,7 @@ def build_report(indexes: list[str], info_delay: float) -> tuple[pd.DataFrame, d
             "Symbol":   sym,
             "Name":     info.get("longName") or c["Name"],
             "Sector":   info.get("sector") or "",
+            "Industry": info.get("industry") or "",
             "Currency": ccy,
         }
         for label, delta in LOOKBACKS.items():
@@ -1138,7 +1126,7 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 # the data contract. The filename embeds this so the user can see at a glance
 # which generation of the script their workbook matches; the Help sheet renders
 # the changelog entries from VERSION_HISTORY below.
-SCHEMA_VERSION = "v03"
+SCHEMA_VERSION = "v04"
 
 # Append-only changelog. init-workbook appends any missing versions to the
 # Help sheet without touching user edits. Date is when the version was minted.
@@ -1162,6 +1150,21 @@ VERSION_HISTORY: list[tuple[str, str, str]] = [
      "now on Monthly winners + Monthly losers; the Losers sheet has the "
      "Owned?=Yes filter pre-selected. Existing 'Monthly movers' sheets are "
      "auto-renamed on next init-workbook or get-quotes."),
+    ("v04", "2026-05-14",
+     "New Industry column in Market (between Sector and Watchlists) — "
+     "sourced from yfinance .info['industry']. AutoFilter now applied on "
+     "every result sheet (Market + Monthly winners + Monthly losers + "
+     "Currencies). Portfolio auto-adoption: unresolved Main!Portfolio "
+     "symbols are looked up on Yahoo and added to the universe with "
+     "Indexes='Portfolio'; truly unresolvable ones surface as an error "
+     "in Main col C of the offending row. Speedups: parallel .info "
+     "(8 workers), parallel price chunks (6 workers), parallel watchlists "
+     "(6 workers), SQLite cache for slow-changing .info fields (7-day TTL), "
+     "freshness skip in get_quotes (4h). The session-passing experiment "
+     "from a draft of v04 was reverted — yfinance 0.2.x requires its own "
+     "curl_cffi session. NOTE: existing v03 workbooks need a full "
+     "rebuild-inventory after upgrading so Market headers align with the "
+     "new Industry column position."),
 ]
 
 DEFAULT_WORKBOOK_PATH = Path(f"stocks_picker_{SCHEMA_VERSION}.xlsm")
@@ -1268,7 +1271,7 @@ def _resolve_workbook(arg_path: str) -> Path:
 # columns are interleaved with each price lookback so a row scan reads
 # "price | % change | price | % change | ..." across.
 MARKET_COLUMNS = [
-    "Symbol", "Name", "Owned?", "Indexes", "Sector", "Watchlists", "Currency",
+    "Symbol", "Name", "Owned?", "Indexes", "Sector", "Industry", "Watchlists", "Currency",
     "Today (EUR)",
     "1D ago (EUR)", "1D %",
     "1W ago (EUR)", "1W %",
@@ -1416,7 +1419,8 @@ def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
 
     if overwrite:
         widths = {
-            "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18, "Sector": 22,
+            "Symbol": 10, "Name": 28, "Owned?": 8, "Indexes": 18,
+            "Sector": 22, "Industry": 26,
             "Watchlists": 38, "Currency": 10,
             "Today (EUR)": 12, "1D ago (EUR)": 12, "1W ago (EUR)": 12, "1M ago (EUR)": 12,
             "6M ago (EUR)": 12, "1Y ago (EUR)": 12, "5Y ago (EUR)": 12,
@@ -1431,6 +1435,31 @@ def _layout_market_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
 def _market_col(name: str) -> int:
     """1-based column index in Market for a header name. Raises if unknown."""
     return MARKET_COLUMNS.index(name) + 1
+
+
+def _check_market_headers(actual_headers: list) -> Optional[str]:
+    """Verify a header row matches MARKET_COLUMNS exactly. Returns None on
+    match, else an error message. Used to detect a stale-schema workbook
+    before get_quotes writes quote data into wrong columns. v04 added
+    Industry after Sector — an older v03 workbook would have its quote
+    columns shifted by 1 unless rebuild_inventory has been re-run since
+    the upgrade.
+    """
+    for col_idx, expected in enumerate(MARKET_COLUMNS, 1):
+        actual = actual_headers[col_idx - 1] if col_idx <= len(actual_headers) else None
+        if actual != expected:
+            return (f"Market column {col_idx} header is {actual!r} but should be "
+                    f"{expected!r}. The workbook was built on a previous schema "
+                    f"(current = {SCHEMA_VERSION}). Run `rebuild-inventory` first "
+                    "to refresh the Market layout.")
+    return None
+
+
+def _validate_market_layout(market_ws: Worksheet) -> Optional[str]:
+    """openpyxl version of _check_market_headers."""
+    headers = [market_ws.cell(row=1, column=i).value
+               for i in range(1, len(MARKET_COLUMNS) + 1)]
+    return _check_market_headers(headers)
 
 
 _TEST_MODE_TRUTHY = {"TRUE", "T", "YES", "Y", "1"}
@@ -1650,6 +1679,7 @@ def _write_market_structural_row(
     market_ws.cell(row=row, column=cols["Owned?"],      value=_owned_for(sym, portfolio))
     market_ws.cell(row=row, column=cols["Indexes"],     value=c["Indexes"])
     market_ws.cell(row=row, column=cols["Sector"],      value=info.get("sector") or "")
+    market_ws.cell(row=row, column=cols["Industry"],    value=info.get("industry") or "")
     market_ws.cell(row=row, column=cols["Watchlists"],  value=", ".join(labels_dedup))
     market_ws.cell(row=row, column=cols["Currency"],    value=ccy)
     desc_cell = market_ws.cell(row=row, column=cols["Description"], value=info.get("description") or "")
@@ -1713,11 +1743,6 @@ def rebuild_inventory(
     portfolio_entries = read_portfolio_entries(wb["Main"])
     _say(f"  Portfolio entries: {len(portfolio)}")
 
-    # Shared Yahoo session: seed cookies once so every parallel worker
-    # in this run reuses ONE cookie jar instead of negotiating its own
-    # (the root cause of HTTP 401 "Invalid Crumb" bursts under load).
-    yahoo_sess = get_yahoo_session()
-
     _say("Fetching index constituents")
     parts = [get_index_constituents(idx) for idx in indexes]
     if not test_mode:
@@ -1737,7 +1762,6 @@ def rebuild_inventory(
             main_ws_local.cell(row=row_idx, column=PORTFOLIO_ERROR_COL, value=msg)
         constituents = resolve_or_adopt_portfolio(
             portfolio_entries, constituents, _write_pf_err,
-            session=yahoo_sess,
         )
 
     if test_mode:
@@ -1767,7 +1791,6 @@ def rebuild_inventory(
         cache_path=cache_path,
         progress=info_progress,
         should_stop=lambda: read_stop_requested(wb["Main"]),
-        session=yahoo_sess,
     )
     if cache_hits:
         _say(f"  .info cache hits: {cache_hits}/{len(constituents)} "
@@ -1966,6 +1989,15 @@ def _handle_button_exception(wb, job_name: str, exc: BaseException, traceback_te
         err.range((target_row, 1)).value = [[
             timestamp, job_name, exc_type, message[:500], traceback_text[:8000],
         ]]
+        # AutoFilter on the current data extent — keeps the sheet sortable
+        # without the user having to enable filters manually after the first
+        # error lands.
+        try:
+            if err.api.AutoFilterMode:
+                err.api.AutoFilterMode = False
+            err.range(f"A1:E{target_row}").api.AutoFilter()
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2045,10 +2077,6 @@ def button_rebuild_inventory() -> None:
         portfolio_entries = _xw_read_portfolio_entries(main)
         status(f"Portfolio entries: {len(portfolio)}")
 
-        # Shared Yahoo session — eliminates per-worker crumb negotiation
-        # under concurrent .info / price load.
-        yahoo_sess = get_yahoo_session()
-
         status("Fetching index constituents…")
         parts = [get_index_constituents(idx) for idx in indexes]
         if not test_mode:
@@ -2065,7 +2093,6 @@ def button_rebuild_inventory() -> None:
                 main.range((row_idx, PORTFOLIO_ERROR_COL)).value = msg
             constituents = resolve_or_adopt_portfolio(
                 portfolio_entries, constituents, _write_pf_err_xw,
-                session=yahoo_sess,
             )
 
         if test_mode:
@@ -2088,7 +2115,6 @@ def button_rebuild_inventory() -> None:
             cache_path=cache_path,
             progress=info_progress,
             should_stop=lambda: _xw_read_stop_requested(main),
-            session=yahoo_sess,
         )
         if cache_hits:
             status(f"  .info cache hits: {cache_hits}/{len(constituents)} "
@@ -2118,6 +2144,7 @@ def button_rebuild_inventory() -> None:
             row[MARKET_COLUMNS.index("Owned?")]      = _owned_for(sym, portfolio)
             row[MARKET_COLUMNS.index("Indexes")]     = c["Indexes"]
             row[MARKET_COLUMNS.index("Sector")]      = info.get("sector") or ""
+            row[MARKET_COLUMNS.index("Industry")]    = info.get("industry") or ""
             row[MARKET_COLUMNS.index("Watchlists")]  = ", ".join(labels_dedup)
             row[MARKET_COLUMNS.index("Currency")]    = ccy
             row[MARKET_COLUMNS.index("Description")] = info.get("description") or ""
@@ -2233,6 +2260,15 @@ def button_get_quotes() -> None:
         test_mode = _xw_read_test_mode(main)
         status(f"quotes: starting (test_mode={test_mode})")
 
+        # Validate schema: header row must match MARKET_COLUMNS exactly.
+        header_vals = market.range((1, 1), (1, len(MARKET_COLUMNS))).value
+        if not isinstance(header_vals, list):
+            header_vals = [header_vals]
+        layout_err = _check_market_headers(header_vals)
+        if layout_err is not None:
+            status(f"⚠ {layout_err}")
+            return
+
         # Read current Market: pull Symbol + Currency + Indexes into a list
         last_row = market.used_range.last_cell.row
         if last_row < 2:
@@ -2282,10 +2318,6 @@ def button_get_quotes() -> None:
         else:
             targets = market_rows
 
-        # Shared Yahoo session — passed into price + .info fetchers so all
-        # parallel workers reuse one cookie jar (no 401 'Invalid Crumb' bursts).
-        yahoo_sess = get_yahoo_session()
-
         status("Fetching FX rates + history")
         fx = get_fx_rates()
         fx_history = get_fx_history()
@@ -2295,8 +2327,7 @@ def button_get_quotes() -> None:
         today = dt.date.today()
         start = today - dt.timedelta(days=int(5.2 * 365))
         end   = today + dt.timedelta(days=1)
-        closes = fetch_close_prices([t[1] for t in targets], start, end,
-                                    session=yahoo_sess)
+        closes = fetch_close_prices([t[1] for t in targets], start, end)
 
         # Speedup C: filter out targets whose Last update is recent.
         lu_col_xw = MARKET_COLUMNS.index("Last update (UTC)") + 1
@@ -2327,7 +2358,6 @@ def button_get_quotes() -> None:
         info_map = fetch_all_info(
             [t[1] for t in stale_targets], delay=0.25, progress=info_progress,
             should_stop=lambda: _xw_read_stop_requested(main),
-            session=yahoo_sess,
         )
         info_stopped = len(info_map) < len(stale_targets)
         if info_stopped:
@@ -2465,6 +2495,11 @@ def _ensure_currencies_sheet_openpyxl(wb, fx_history: dict[str, pd.Series]) -> N
         for c in range(1, len(CURRENCY_HEADERS) + 1):
             ws.cell(row=r, column=c).value = None
 
+    # AutoFilter spanning the current data extent — keeps the user's
+    # sort/filter affordance consistent with Market / Monthly winners / losers.
+    last_col = get_column_letter(len(CURRENCY_HEADERS))
+    ws.auto_filter.ref = f"A1:{last_col}{1 + len(rows)}"
+
 
 def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) -> None:
     """Write/refresh the Currencies sheet using xlwings (button path)."""
@@ -2492,6 +2527,17 @@ def _ensure_currencies_sheet_xlwings(wb_xw, fx_history: dict[str, pd.Series]) ->
         cur.range("A:A").api.ColumnWidth = 12
         for col_idx in range(2, len(CURRENCY_HEADERS) + 1):
             cur.range(f"{get_column_letter(col_idx)}:{get_column_letter(col_idx)}").api.ColumnWidth = 13
+
+    # AutoFilter on the current data extent (toggled cleanly so the user
+    # always sees a fresh filter row, even if Excel had one stale from a
+    # prior run with a different row count).
+    last_col_letter = get_column_letter(len(CURRENCY_HEADERS))
+    try:
+        if cur.api.AutoFilterMode:
+            cur.api.AutoFilterMode = False
+        cur.range(f"A1:{last_col_letter}{1 + len(rows)}").api.AutoFilter()
+    except Exception as e:
+        log.debug(f"Currencies AutoFilter apply failed (non-fatal): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2524,8 +2570,7 @@ def _portfolio_symbol_resolves(sym: str, market_upper: set[str],
     return any(m.startswith(s + ".") for m in market_upper)
 
 
-def _yahoo_lookup_for_adoption(sym: str,
-                               session: Optional[requests.Session] = None) -> Optional[dict]:
+def _yahoo_lookup_for_adoption(sym: str) -> Optional[dict]:
     """Best-effort Yahoo lookup. Returns a dict with at least Name if Yahoo
     knows the ticker, else None.
 
@@ -2534,8 +2579,7 @@ def _yahoo_lookup_for_adoption(sym: str,
     enough to confirm the ticker is live.
     """
     try:
-        t = yf.Ticker(sym, session=session) if session is not None else yf.Ticker(sym)
-        info = t.info or {}
+        info = yf.Ticker(sym).info or {}
     except Exception as e:
         log.debug(f"yahoo lookup '{sym}' raised: {e}")
         return None
@@ -2554,7 +2598,6 @@ def resolve_or_adopt_portfolio(
     portfolio_entries: list[tuple[int, str]],
     constituents: pd.DataFrame,
     write_error: Callable[[int, Optional[str]], None],
-    session: Optional[requests.Session] = None,
 ) -> pd.DataFrame:
     """Auto-adopt unresolved portfolio entries into the constituents universe.
 
@@ -2579,7 +2622,7 @@ def resolve_or_adopt_portfolio(
         if _portfolio_symbol_resolves(sym, market_upper, market_roots):
             write_error(row_idx, None)
             continue
-        info = _yahoo_lookup_for_adoption(sym, session=session)
+        info = _yahoo_lookup_for_adoption(sym)
         if info is not None:
             extra_rows.append({
                 "Symbol": sym,
@@ -2971,6 +3014,11 @@ def get_quotes(
         test_mode = read_test_mode(main_ws)
     _say(f"get_quotes: starting (test_mode={test_mode})")
 
+    layout_err = _validate_market_layout(market_ws)
+    if layout_err is not None:
+        log.error(layout_err)
+        return 1
+
     portfolio = read_portfolio_symbols(main_ws)
     market_rows = _read_market_symbols(market_ws)
 
@@ -3001,10 +3049,6 @@ def get_quotes(
     else:
         targets = market_rows
 
-    # Shared Yahoo session — passed into price + .info fetchers so all
-    # parallel workers reuse one cookie jar (avoids 401 'Invalid Crumb').
-    yahoo_sess = get_yahoo_session()
-
     _say("Fetching FX rates + history")
     fx = get_fx_rates()
     fx_history = get_fx_history()
@@ -3014,8 +3058,7 @@ def get_quotes(
     today = dt.date.today()
     start = today - dt.timedelta(days=int(5.2 * 365))
     end   = today + dt.timedelta(days=1)
-    closes = fetch_close_prices([t[1] for t in targets], start, end,
-                                session=yahoo_sess)
+    closes = fetch_close_prices([t[1] for t in targets], start, end)
 
     # Speedup C: skip .info for any row whose Last update is recent. We
     # still refresh prices for every target (cheap, batched) — only the
@@ -3045,7 +3088,6 @@ def get_quotes(
     info_map = fetch_all_info(
         [t[1] for t in stale_targets], delay=info_delay, progress=info_progress,
         should_stop=lambda: read_stop_requested(main_ws),
-        session=yahoo_sess,
     )
 
     _say("Writing quote columns")
