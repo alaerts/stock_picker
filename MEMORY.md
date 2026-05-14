@@ -1,5 +1,27 @@
 # MEMORY.md — Daily Multi-Index Stock Report
 
+## Session Summary, 2026-05-14
+**Worked on:** Performance, polish, and a first tagged release on top of the v03 architecture from session 01. Session ran 2026-05-13 → 2026-05-14 across 11 commits.
+
+**Completed:**
+- Fixed "Monthly winners/losers empty in test mode" through three rounds of bug-hunting — root cause was the adaptive `Owned?=Yes` AutoFilter hiding all rows.
+- Cell-based STOP control (Form-control checkbox → `Main!B13`, polled every 25 tickers), busy-flag guard (`Main!B14`) against double-clicks.
+- Speedups A+C+F: parallel `.info` via `ThreadPoolExecutor` (8 workers), freshness skip in `get_quotes` (4h window), SQLite cache for slow-changing .info fields (7-day TTL). 982-ticker rebuild dropped from ~4–10 min to ~57s; get_quotes from ~5 min to ~50s.
+- Portfolio auto-adoption: unresolved `Main!Portfolio` entries get a Yahoo lookup. Found → adopted into universe as synthetic constituents with `Indexes="Portfolio"`. Not found → error written to `Main` column C of the offending row.
+- v02 → v03 workbook rename (preserving all user cosmetic edits).
+- First annotated release tag: **v1.0.0** at `69d159e`, pushed.
+- v04 schema bump: Industry column added between Sector and Watchlists. AutoFilter applied on all 4 result sheets (Market, Monthly winners, Monthly losers, Currencies). Header re-styling fix so new schema-bump columns get bold automatically. FX rate format switched to accounting-comma style at 4dp.
+- Header re-assertion in `rebuild_inventory` so SCHEMA_VERSION bumps propagate to existing workbooks without a clean init.
+- Test pyramid grew: 132 → 181 offline, 16 integration, 14 xlwings = **212 passing**.
+
+**Decisions made (durable):**
+- **No session-passing to yfinance.** yfinance 0.2.x raises `YFDataException` on plain `requests.Session` (requires curl_cffi for TLS fingerprinting). 6 regression tests pin this. Batch 1 from this session tried it and broke EVERY .info call until reverted — the 401s we worried about are already retried internally by yfinance.
+- **Excel strips openpyxl autofilter on manual save.** Every code path that writes data must re-apply Market AutoFilter to self-heal. Both `rebuild_inventory` AND `get_quotes` now do this.
+- **Header cells get re-styled when their value is rewritten.** Schema-bump columns (e.g. v04's Industry, v03's Owned?) would otherwise inherit no styling — the 2026-05-14 I1 bold=False bug.
+- **Accounting-comma format on FX rates** matching Market's EUR price columns. Kept at 4 decimals (2dp would round 1.1735 → 1.17 and hide intra-week moves).
+
+**Next session:** Run `get-quotes` once first — that single run will heal Market AutoFilter, re-bold I1, and re-format Currencies. Then consider Batch 2 (price-history SQLite cache + watchlist cache for sub-10s warm reruns), or the new-reports brainstorm (Sector dashboard / Owned positions deep-dive / Drawdown opportunities / Daily email digest). Full handoff in `HANDOFF.md` and `claude_session_02.html`.
+
 ## 2026-05-06, Watchlists rewritten — Yahoo screener API + dataroma.com (RESOLVED)
 **What was decided:** Implemented the slim 6-list mapping (Option B). The original 8-list spec is gone:
   1. Recent 52-Week Highs — Yahoo `recent_52_week_highs`

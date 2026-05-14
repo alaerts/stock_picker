@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude Session 02 — Stock Picker</title>
+<style>
+  :root {
+    --user-bg: #eef5ff;
+    --user-border: #2563eb;
+    --asst-bg: #fafafa;
+    --asst-border: #555;
+    --code-bg: #f4f4f5;
+    --muted: #666;
+    --accent: #1e40af;
+    --warning-bg: #fef3c7;
+    --warning-border: #f59e0b;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 2rem auto;
+    padding: 0 1.5rem 4rem;
+    line-height: 1.55;
+    color: #1f2937;
+    background: #fff;
+  }
+  header.page {
+    border-bottom: 2px solid #1f2937;
+    padding-bottom: 1rem;
+    margin-bottom: 2rem;
+  }
+  header.page h1 {
+    margin: 0 0 0.4rem;
+    font-size: 1.75rem;
+  }
+  header.page .meta {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  nav.toc {
+    background: #fffbea;
+    border: 1px solid #fde68a;
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 2.5rem;
+  }
+  nav.toc h2 {
+    margin: 0 0 0.6rem;
+    font-size: 1.05rem;
+    color: #92400e;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.4rem;
+    columns: 2;
+    column-gap: 2rem;
+  }
+  nav.toc li { margin: 0.15rem 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section.phase {
+    margin: 2.5rem 0 1.5rem;
+  }
+  section.phase > h2 {
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 0.4rem;
+    margin-bottom: 1rem;
+    font-size: 1.3rem;
+    color: #111;
+  }
+  section.phase > .summary {
+    font-style: italic;
+    color: var(--muted);
+    margin-bottom: 1rem;
+  }
+  .turn {
+    margin: 1.2rem 0;
+    padding: 0.9rem 1.2rem;
+    border-radius: 6px;
+    border-left: 4px solid;
+  }
+  .turn.user { background: var(--user-bg); border-color: var(--user-border); }
+  .turn.assistant { background: var(--asst-bg); border-color: var(--asst-border); }
+  .turn .sender {
+    font-weight: 700;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 0.4rem;
+  }
+  .turn p { margin: 0.5rem 0; }
+  .turn ul, .turn ol { margin: 0.4rem 0 0.6rem 0; padding-left: 1.6rem; }
+  code, pre, kbd {
+    font-family: "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 0.08rem 0.32rem;
+    border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.85rem 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    line-height: 1.45;
+    font-size: 0.85rem;
+    margin: 0.6rem 0;
+  }
+  pre code { background: transparent; padding: 0; }
+  .commit {
+    display: inline-block;
+    font-family: monospace;
+    background: #e5e7eb;
+    padding: 0.05rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.8em;
+    color: #374151;
+  }
+  table {
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 0.35rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f3f4f6; }
+  .note {
+    background: var(--warning-bg);
+    border-left: 4px solid var(--warning-border);
+    padding: 0.5rem 0.9rem;
+    border-radius: 4px;
+    margin: 0.6rem 0;
+    font-size: 0.92em;
+  }
+  .lesson {
+    background: #ecfdf5;
+    border-left: 4px solid #10b981;
+    padding: 0.5rem 0.9rem;
+    border-radius: 4px;
+    margin: 0.6rem 0;
+    font-size: 0.92em;
+  }
+  footer.page {
+    margin-top: 4rem;
+    padding-top: 1rem;
+    border-top: 1px solid #ddd;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<header class="page">
+  <h1>Claude Session 02 — Stock Picker</h1>
+  <p class="meta">
+    Continuation of <a href="claude_session_01.html">Session 01</a>.
+    Claude Opus 4.7 (1M context). Date: 2026-05-13 → 2026-05-14.
+    Repo: <a href="https://github.com/alaerts/stock_picker">github.com/alaerts/stock_picker</a>.
+    First major release tag: <a href="https://github.com/alaerts/stock_picker/releases/tag/v1.0.0">v1.0.0</a>.
+  </p>
+</header>
+
+<nav class="toc">
+  <h2>Table of contents</h2>
+  <ol>
+    <li><a href="#p01">Resume from compaction</a></li>
+    <li><a href="#p02">"Monthly winners/losers still empty" — three rounds</a></li>
+    <li><a href="#p03">Cell-based STOP + busy-flag + portfolio validation</a></li>
+    <li><a href="#p04">Speedups A+C+F (parallel .info + freshness + SQLite)</a></li>
+    <li><a href="#p05">Auto-adopt unresolved portfolio symbols</a></li>
+    <li><a href="#p06">v02 → v03 rename, v1.0.0 release tag</a></li>
+    <li><a href="#p07">Yahoo 401 investigation + Batch 1 (failed experiment)</a></li>
+    <li><a href="#p08">Batch 1 reverted: yfinance requires curl_cffi</a></li>
+    <li><a href="#p09">v04: Industry column + AutoFilter on all sheets</a></li>
+    <li><a href="#p10">Schema mismatch bug after full rebuild</a></li>
+    <li><a href="#p11">Three more bugs: AutoFilter, I1 bold, comma style</a></li>
+    <li><a href="#p12">Session end + handoff</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<section class="phase" id="p01">
+  <h2>1 — Resume from compaction</h2>
+  <p class="summary">Session 01 ended with HANDOFF.md, claude_session_01.html, and a clean tree at <span class="commit">c0a6afa</span>. This session opened with the conversation already context-compacted — a fresh agent resumed mid-task.</p>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Re-read the project state from <code>HANDOFF.md</code>, the working tree, and recent commits. Confirmed the user's <code>stocks_picker_v02.xlsm</code> workbook had: the v03 features (Monthly winners/losers, Owned?, AutoFilter), 982 Market rows, cosmetic edits (Main!A1, Help!A1, Market freeze panes at A2, portfolio entries), and that <code>_resolve_workbook</code> would still pick it up.</p>
+    <p>The user's most recent message in the prior session: "<em>The Monthly losers is still empty in test mode. That is again 2 bugs (the code and the test code).</em>" plus a 5-item batch including the In-Excel cell-based stop, button-disabling, owned-stock validation error, and speedup options A+C+F to implement.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p02">
+  <h2>2 — "Monthly winners/losers still empty" — three rounds</h2>
+  <p class="summary">Same symptom, three different causes. Each fix only got us partway.</p>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p><strong>Round 1 (<span class="commit">bb87937</span>)</strong>: <code>rebuild_inventory --test</code> wiped Market down to 5 rows. The ranking computation reads ALL Market rows; with only 5 it has nothing meaningful to rank. Fix: in test mode, preserve Market and only structurally-update rows matching the test constituents by Symbol.</p>
+    <p><strong>Round 2 (<span class="commit">70d2d4f</span>)</strong>: User still saw empty ranking. <code>get_quotes --test</code> was refreshing only 1 ticker. The post-loop ranking saw mostly stale data with the 1 refreshed row not enough to populate winners/losers. Fix: <code>TEST_MODE_QUOTE_REFRESH_LIMIT = 20</code>, portfolio symbols first, rest after.</p>
+    <p><strong>Round 3 (<span class="commit">9fcbdfd</span>)</strong>: Still empty. I read the user's actual workbook via openpyxl to investigate. Found AED.BR at row 2 in Monthly losers — data <em>was</em> there. The AutoFilter pre-filter on <code>Owned?=Yes</code> was hiding every row because none of the 35 losers were owned. Fix: <code>has_owned_losers = any(_is_owned(m.get("owned")) for m in losers)</code> — only pre-apply the filter when at least one owned loser exists.</p>
+  </div>
+
+  <div class="lesson">
+    <strong>Lesson:</strong> "Empty sheet" is a symptom that can come from data wipe, data missing, or data hidden. Tests must check the FILTER STATE, not just <code>cell.value is not None</code> — the previous tests passed regardless of whether the user could actually see the rows.
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p03">
+  <h2>3 — Cell-based STOP + busy-flag + portfolio validation</h2>
+  <p class="summary">User wanted a STOP button. Technical constraint: xlwings RunPython is synchronous, so a button macro queues — only Form Controls update LinkedCells instantly during a VBA block.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Implement the "In-Excel cell-based stop". Trigger is another button, not a checkbox. While a macros is running, disable the buttons except the Stop button. Trigger an error if you cannot find one of my owned stock.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>I explained the constraint: xlwings <code>RunPython</code> blocks the VBA thread synchronously. A button click during that block would queue — Excel can't dispatch it until Python returns. Only Form Controls (checkboxes) update their LinkedCell instantly via Excel's internal cell engine, bypassing the VBA thread. Offered three options:</p>
+    <ol>
+      <li>STOP checkbox writing TRUE to <code>Main!B13</code> (works, but not a button)</li>
+      <li>Async/AppDoEvents in VBA (fragile, breaks under .info loops)</li>
+      <li>Drop the stop feature</li>
+    </ol>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>okay to go with number one</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Implemented (<span class="commit">fd0203c</span>):</p>
+    <ul>
+      <li><strong>Cell-based STOP</strong>: <code>MAIN_CELLS["StopRequested"]="B13"</code>, polled every 25 tickers inside <code>fetch_all_info</code>. On True, breaks the loop and returns the partial dict. Caller detects via <code>len(out) &lt; len(tickers)</code>.</li>
+      <li><strong>Busy-flag guard</strong>: <code>MAIN_CELLS["JobRunning"]="B14"</code>. VBA wrapper sets it TRUE at job start, FALSE on cleanup. <code>GuardJobStart()</code> refuses to launch a second job — prevents accidental double-clicks.</li>
+      <li><strong>Owned-stock validation</strong>: new <code>_check_portfolio_symbols_resolve()</code> raises RuntimeError if any <code>Main!Portfolio</code> entry doesn't match a constituent (with or without exchange suffix). Catches typos like "KBC" when the workbook stores "KBC.BR".</li>
+    </ul>
+    <p>Wired into all 4 paths (CLI rebuild, CLI get_quotes, button rebuild, button get_quotes). 9 new tests, all green.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p04">
+  <h2>4 — Speedups A+C+F (parallel .info + freshness + SQLite)</h2>
+  <p class="summary">User asked for the three speedup options I'd proposed earlier. Implemented all three in one commit (<span class="commit">42856b5</span>).</p>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p><strong>Speedup A</strong>: <code>fetch_all_info</code> rewritten to use <code>ThreadPoolExecutor(max_workers=12)</code>. The previous sequential <code>time.sleep(0.25)</code> per ticker is gone; concurrency cap is the new rate-limiter. Progress + should_stop callbacks preserved via <code>as_completed</code>. Pending futures cancelled on STOP.</p>
+    <p><strong>Speedup C</strong>: <code>get_quotes</code> reads each row's <code>Last update (UTC)</code> and skips <code>.info</code> for rows refreshed within <code>QUOTE_FRESHNESS_HOURS</code> (default 4h). Prices still refresh every run (they're cheap and batched). Re-runs within the window become near-instant on the .info side.</p>
+    <p><strong>Speedup F</strong>: new <code>InfoCache</code> SQLite wrapper for slow-changing fields used by <code>rebuild_inventory</code> (currency / sector / longName / description). 7-day TTL. Cache file <code>stocks_info_cache.sqlite</code> sits next to the workbook (gitignored). <code>fetch_all_info_with_cache</code> returns <code>(info_map, cache_hits)</code> so status text can surface the hit count.</p>
+    <p>11 new offline tests cover all three speedups. Real-world wall-clock on user's 982-ticker workbook:</p>
+    <table>
+      <tr><th>Job</th><th>Before</th><th>After (cold cache)</th><th>After (warm cache, in freshness window)</th></tr>
+      <tr><td><code>rebuild-inventory</code></td><td>~4–10 min</td><td>~57s</td><td>~10s</td></tr>
+      <tr><td><code>get-quotes</code></td><td>~5 min</td><td>~50s</td><td>~5s</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p05">
+  <h2>5 — Auto-adopt unresolved portfolio symbols</h2>
+  <p class="summary">Portfolio validation kept aborting rebuilds because 4 of the user's ETF entries (CSX5.AS, CSKRL.XC, MEUS.L, VAGT.DE) weren't in any tracked index. User asked for a different policy: try Yahoo, adopt if found, otherwise write an error to the workbook.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>If Portfolio validation trips, automatically add them to the tracked universe. If that fails (cannot find it in some other form in Yahoo etc), post the error in sheet Main, same row, column C. Lower max_workers from 12 → 8.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Replaced <code>_check_portfolio_symbols_resolve</code> (which raised) with <code>resolve_or_adopt_portfolio</code> (<span class="commit">69d159e</span>):</p>
+    <ul>
+      <li>For each unresolved entry: <code>yf.Ticker(sym).info</code>. If <code>regularMarketPrice</code> or <code>symbol</code> / <code>longName</code> is present, append a synthetic constituent row with <code>Indexes="Portfolio"</code> — flows through .info / prices / Owned? like any other row.</li>
+      <li>If Yahoo doesn't know the ticker, write the error string to <strong>Main column C</strong> of the offending portfolio row. Stale errors clear on the next successful run.</li>
+      <li>New row-aware reader <code>read_portfolio_entries</code> (and xlwings counterpart) preserves the row index so errors land on the right row.</li>
+    </ul>
+    <p>Also lowered <code>max_workers</code> 12 → 8 to ease the HTTP 401 "Invalid Crumb" bursts observed under heavy parallel load. 7 new tests, suite at 156 passed.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p06">
+  <h2>6 — v02 → v03 rename, v1.0.0 release tag</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>I want to keep all those cosmetic changes.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>I'd asked about v02 → v03 paths: rename the file, stay on v02, or add migration logic. User chose <strong>rename</strong>. One shell command, all cosmetics intact:</p>
+    <pre><code>mv stocks_picker_v02.xlsm stocks_picker_v03.xlsm</code></pre>
+    <p><code>_resolve_workbook</code> automatically picked the new file (highest existing version). Custom Main!A1 title, B15="Description" portfolio header, col widths, Help credit line, Market A2 freeze, portfolio data rows — all preserved.</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Commit and push as major release</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Working tree clean (recent commits already pushed). Created annotated tag <strong>v1.0.0</strong> on <span class="commit">69d159e</span> with release notes summarizing: two-jobs architecture, 982 tickers across 7 indexes + 38 ETFs, Excel buttons, cell-based STOP + busy-flag, portfolio auto-adoption, speedups A+C+F, Monthly winners/losers, Currencies sheet, 181-test pyramid. Pushed.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p07">
+  <h2>7 — Yahoo 401 investigation + Batch 1 (failed experiment)</h2>
+  <p class="summary">User asked about the 401 errors that appeared in logs. I proposed a structural fix that turned out to be wrong.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Regarding "Yahoo 401s under parallel load — the rows still completed but if you see empty P/E columns spike": this is a serious problem. Suggest structural solutions. Also the speed of the two jobs is a problem. Trace in detail and suggest solutions</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Detailed trace of the two jobs:</p>
+    <table>
+      <tr><th>Phase</th><th>Time</th><th>Bottleneck</th></tr>
+      <tr><td><code>rebuild_inventory</code> Wikipedia constituents</td><td>~1s</td><td>7 serial HTTPS</td></tr>
+      <tr><td>Watchlists (6 lists)</td><td>~24s</td><td>serial + pagination</td></tr>
+      <tr><td>Parallel .info (977 fresh)</td><td>~27s</td><td>HTTP + occasional 401s</td></tr>
+      <tr><td>openpyxl save</td><td>~3s</td><td>local I/O</td></tr>
+      <tr><td><code>get_quotes</code> price history</td><td>~40s</td><td>serial chunks + 1s sleep</td></tr>
+      <tr><td>Parallel .info P/E</td><td>~7s</td><td>HTTP (warmed)</td></tr>
+    </table>
+    <p>Diagnosis on the 401s: each <code>yf.Ticker(...)</code> creates its own <code>requests.Session</code> with its own cookie jar — 8 parallel workers means 8 cookie+crumb negotiations racing. Proposed <strong>Batch 1</strong>: shared <code>requests.Session</code> seeded once via <code>get_yahoo_session()</code>, passed into every <code>yf.Ticker(sym, session=...)</code> and <code>yf.download(..., session=...)</code> call. Plus parallel <code>fetch_close_prices</code> (6 workers, drop the 1s sleep), parallel <code>fetch_all_watchlists</code> (6 workers).</p>
+  </div>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>yes</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Implemented (<span class="commit">8a530b2</span>): <code>get_yahoo_session</code> helper, retry-on-empty in <code>fetch_ticker_info</code>, parallel price chunks, parallel watchlists, shared session threaded through all 4 caller entry points. 194 tests passed. Pushed.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p08">
+  <h2>8 — Batch 1 reverted: yfinance requires curl_cffi</h2>
+  <p class="summary">User flagged the CSX5.AS adoption error and asked me to add a test. Investigating it surfaced that Batch 1 had been silently destroying yfinance.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>For CSX5.AS, you returned the error "Symbol not found on Yahoo Finance (CSX5.AS)" yet there is <code>https://finance.yahoo.com/quote/CSX5.AS/</code>.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Direct test: <code>yf.Ticker('CSX5.AS').info</code> returns 82 fields including <code>regularMarketPrice=228.75</code>, <code>longName="iShares VII PLC..."</code>. Symbol obviously exists. Then I tried with the shared session from Batch 1:</p>
+    <pre><code>no session:   {'Name': 'iShares VII PLC...', 'currency': 'EUR'}
+with session: None</code></pre>
+    <p>The shared session was breaking yfinance. Verified with <code>yf.download</code>:</p>
+    <pre><code>YFDataException: Yahoo API requires curl_cffi session
+not &lt;class 'requests.sessions.Session'&gt;.
+Solution: stop setting session, let YF handle.</code></pre>
+    <p>yfinance 0.2.x rejects plain <code>requests.Session</code> — it requires <code>curl_cffi</code> for TLS fingerprinting. The maintainers' recommendation is the OPPOSITE of what I did. Reverted all session passing (<span class="commit">14118e8</span>). Kept the bits that didn't depend on session: retry-on-empty, parallel <code>fetch_close_prices</code>, parallel <code>fetch_all_watchlists</code>.</p>
+  </div>
+
+  <div class="lesson">
+    <strong>Lesson:</strong> When a library has explicit error messages telling you what NOT to do, listen. The 401s we observed were already being retried by yfinance internally (visible in ERROR logs but invisible in results — "982 ok, 0 failed"). The "structural fix" was solving a non-problem AND introducing a real one.
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p09">
+  <h2>9 — v04: Industry column + AutoFilter on all sheets</h2>
+  <p class="summary">Same commit as the revert added the user's other asks: Industry column, consistent filtering across result sheets.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>OK. Also add Industry. Turn on filtering in all result sheets</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Added <strong>Industry</strong> column to MARKET_COLUMNS (between Sector and Watchlists). Wired through <code>fetch_ticker_info</code>, <code>InfoCache</code> (with <code>ALTER TABLE</code> migration for pre-v04 cache files), <code>_write_market_structural_row</code>, the xlwings rebuild row builder, and the legacy <code>build_report</code>.</p>
+    <p>Bumped <strong>SCHEMA_VERSION = "v04"</strong>. Added VERSION_HISTORY entry. Added <code>_check_market_headers</code> + <code>_validate_market_layout</code> to guard <code>get_quotes</code> from writing into wrong columns on a pre-v04 workbook layout (clear "run rebuild-inventory first" message).</p>
+    <p>AutoFilter was already on Market / Monthly winners / Monthly losers. Added to <strong>Currencies</strong> (both openpyxl + xlwings paths) and to the <strong>Errors</strong> sheet (xlwings path, re-applied on each new error row).</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p10">
+  <h2>10 — Schema mismatch bug after full rebuild</h2>
+  <p class="summary">User did the full rebuild then got the validator error. The "stale headers after a SCHEMA bump" bug that the validator was supposed to catch was actually caused by the rebuild itself not re-asserting headers.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Add test to catch such bugs in the future. Also, I got the following error despite a full rebuild. Add test to catch that bug then fix it: ⚠ Market column 6 header is 'Watchlists' but should be 'Industry'. The workbook was built on a previous schema (current = v04). Run `rebuild-inventory` first to refresh the Market layout.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Root cause: <code>rebuild_inventory</code> cleared data rows (rows 2..N) but never touched the header row. The data went into new MARKET_COLUMNS positions (Industry at col 6, Watchlists shifted to col 7), but the headers still said "Watchlists" at col 6. The layout validator correctly flagged the mismatch.</p>
+    <p>Wrote the failing regression test first (TDD), then fix (<span class="commit">89382a4</span>):</p>
+    <ul>
+      <li><strong>CLI rebuild</strong>: added <code>_layout_market_sheet(market_ws, overwrite=False)</code> before writing data — re-asserts row 1 against current MARKET_COLUMNS.</li>
+      <li><strong>xlwings rebuild</strong>: same bug, extracted into testable helper <code>_xw_ensure_market_headers(market, status)</code>. No-op when headers already correct, rewrites + bolds when they're not.</li>
+      <li><strong>6 yfinance-contract regression tests</strong>: spy on <code>yf.Ticker</code> / <code>yf.download</code> constructors and assert no <code>session=</code> kwarg slips through. Signature-level checks. Guard that <code>get_yahoo_session</code> stays removed.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p11">
+  <h2>11 — Three more bugs: AutoFilter, I1 bold, comma style</h2>
+  <p class="summary">User inspected the workbook and reported three problems in one message.</p>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Turn on filtering in all 4 result sheets. In the monthly winner sheet, cell I1 formatting is wrong. Use comma style formatting on all currencies.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Inspected workbook via openpyxl. All three bugs confirmed (<span class="commit">5c90809</span>):</p>
+    <ol>
+      <li><strong>AutoFilter missing on all 4 result sheets</strong> — even Market! Root cause: Excel strips openpyxl-set <code>&lt;autoFilter&gt;</code> elements on manual save. <code>rebuild_inventory</code> was the only path that set Market's filter, so once Excel stripped it the state persisted forever. Fix: <code>get_quotes</code> (CLI + xlwings) now re-applies Market AutoFilter at the end of every run. All 4 sheets self-heal on every CLI or button run.</li>
+      <li><strong>I1 bold=False</strong> — only I1 was unstyled. Root cause: <code>_ensure_ranking_sheet_openpyxl</code> only applied bold + fill when <code>is_new=True</code>. When v03 added Owned? to RANKING_HEADERS, the new I1 got its value rewritten but no styling. Same family of bug affects <code>_layout_market_sheet</code> (v04 Industry would have hit it on Market) and <code>_ensure_currencies_sheet_openpyxl</code>. Fix: re-apply Font.Bold + PatternFill whenever a header VALUE is rewritten. Preserves user cosmetics on already-correct cells; styles new schema-bump cells.</li>
+      <li><strong>Comma style on currencies</strong> — was <code>"#,##0.0000"</code> (plain comma). Switched to accounting-style <code>'_-* #,##0.0000_-;-* #,##0.0000_-;_-* "-"????_-;_-@_-'</code> matching Market's EUR price columns. Kept at 4 decimals (2dp would round 1.1735 → 1.17 and hide intra-week FX moves).</li>
+    </ol>
+    <p>5 new regression tests. Final suite: <strong>212 passed</strong> (181 offline + 16 integration + 14 xlwings + 1 other).</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section class="phase" id="p12">
+  <h2>12 — Session end + handoff</h2>
+
+  <div class="turn user">
+    <div class="sender">User</div>
+    <p>Save everything that happened since claude_session_01.html in claude_session_02.html. Update HANDOFF.md. Then finish the session.</p>
+  </div>
+
+  <div class="turn assistant">
+    <div class="sender">Assistant</div>
+    <p>Wrote this file. HANDOFF.md updated to reflect v04 state. MEMORY.md got the session-summary entry per the project rule. Final state at handoff: <strong>v1.0.0 tag</strong> on <span class="commit">69d159e</span>, <strong>SCHEMA_VERSION="v04"</strong> in code, workbook <code>stocks_picker_v03.xlsm</code> (filename lags one version — <code>_resolve_workbook</code> handles it transparently), 11 new commits on <code>main</code>, 212 tests passing.</p>
+  </div>
+</section>
+
+<footer class="page">
+  <p>
+    Generated 2026-05-14. Final commit at handoff: <span class="commit">5c90809</span>.
+    Tag: <strong>v1.0.0</strong> at <span class="commit">69d159e</span>.
+    See <a href="HANDOFF.md">HANDOFF.md</a> for current state and outstanding work.
+    Read <a href="CLAUDE.md">CLAUDE.md</a> + <a href="MEMORY.md">MEMORY.md</a> to pick this project back up.
+  </p>
+</footer>
+
+</body>
+</html>

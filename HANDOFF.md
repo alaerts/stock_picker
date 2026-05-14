@@ -1,162 +1,130 @@
-# Stock Picker — Session Handoff (2026-05-06 to 2026-05-13)
+# Stock Picker — Session Handoff (through 2026-05-14)
 
-This document summarizes what we built together in this multi-day session, the decisions taken, the current state of the repo, and outstanding work. Read it first if you (or future-me) are picking the project back up.
+Two-session pair-programming run with Claude Opus 4.7. Session 01 (2026-05-06 → 2026-05-13) bootstrapped the project from a single-file script into a two-jobs persistent-workbook architecture with the v03 schema. Session 02 (2026-05-13 → 2026-05-14) added performance, polish, a tagged release, and the v04 schema. Read this first if you're picking it back up.
+
+- Session 01 HTML digest: [claude_session_01.html](claude_session_01.html)
+- Session 02 HTML digest: [claude_session_02.html](claude_session_02.html)
 
 ## Repo
 
 - **GitHub:** https://github.com/alaerts/stock_picker (public, branch `main`)
+- **First major release:** [v1.0.0](https://github.com/alaerts/stock_picker/releases/tag/v1.0.0) at `69d159e` — annotated tag pushed on 2026-05-14.
 - **Local:** `c:\Dev\my\stock_picker\`
-- **Active workbook:** `stocks_picker_v02.xlsm` (~761 KB, 983 Market rows, your portfolio)
-- **Schema version (code):** `v03` (workbook still on v02 filename — see "Outstanding")
-
-## Initial objectives
-
-When the session opened, the project was a single-file Python script (`stocks_report.py`) that wrote a fresh dated Excel report each run. The original BEL 20 smoke test wouldn't even start. Goals over the session:
-
-1. Get the existing single-shot script working end-to-end against current data sources.
-2. Verify watchlist data is real (early discovery: it wasn't — see "Decisions").
-3. Move the project to GitHub with a sensible commit cadence.
-4. Re-architect into a "two-jobs + persistent workbook" model the user could drive from Excel buttons.
-5. Add several new Excel-side features (Help, Currencies, Monthly winners, Monthly losers, ETFs, hyperlinks, AutoFilter, schema versioning).
-6. Build a real test pyramid (offline / network-integration / Excel-COM) that catches the bug classes we were hitting in production.
+- **Active workbook:** `stocks_picker_v03.xlsm` (renamed from v02 in session 02 to preserve cosmetic edits; `_resolve_workbook` always picks the highest-versioned file regardless of code-side SCHEMA_VERSION)
+- **Schema version in code:** `v04` (Industry column added; workbook auto-upgrades on next `rebuild-inventory`)
 
 ## Decisions taken (durable)
 
+The 10 from session 01 still hold. Session 02 added:
+
 | # | Decision | Notes |
 |---|----------|-------|
-| 1 | **6-list watchlist mapping (Option B)** | Yahoo's legacy `/u/yahoo-finance/watchlists/{slug}/` pages were dead. We kept Berkshire via the undocumented `top_stocks_owned_by_warren_buffet` scrIds + `recent_52_week_highs` from Yahoo screener, and switched the rest to dataroma.com (4 super-investor lists). |
-| 2 | **Two-jobs architecture** | `rebuild_inventory` (slow, ~10 min, structural data) + `get_quotes` (daily, ~10 min, prices and P/E). |
-| 3 | **One persistent workbook** | `stocks_picker_v{NN}.xlsm`. Replaces the prior "fresh dated xlsx per run". The user manually maintains the Portfolio sheet inside; data sheets are refreshed by the jobs. |
-| 4 | **xlwings + VBA buttons** | Two Excel buttons (`RebuildInventory`, `GetQuotes`) + a real form-control checkbox for Test mode. VBA module ships in `vba/stocks_picker.bas` and is auto-imported by `setup-buttons` (requires "Trust access to VBA project object model"). |
-| 5 | **One row per Symbol with `Indexes` list** | A stock in multiple indexes (e.g. SAP.DE in DAX + ESTOXX50) is ONE row with `Indexes = "DAX, ESTOXX50"`. |
-| 6 | **`KNOWN_EXCHANGE_SUFFIXES` cross-index normalization** | A ticker arriving fully-qualified (e.g. `AIR.PA` in DAX's table) passes through `normalize_ticker` unchanged. Prevents double-suffix bugs like `AIR.PA.DE`. |
-| 7 | **Cosmetic preservation rule** | `init-workbook` re-runs on an existing file MUST NOT touch the Main sheet (no rewriting labels, no restyling, no width resets). User edits — including deliberate clearances — survive. Per-cell rule in `_layout_main_sheet`. Same idea for Currencies/Movers headers (text re-asserted because column-name lookups depend on it; styling gated on fresh creation). |
-| 8 | **Error reporting: log file + Errors sheet + Status cell** | Replaces the truncated VBA MsgBox. `button_*` functions catch all exceptions and surface them in three places without re-raising. |
-| 9 | **Schema versioning** | `SCHEMA_VERSION` constant in code. `VERSION_HISTORY` list. `init-workbook` auto-populates a row per version into the Help sheet (append-only). Bumped on major changes. Filename mirrors. |
-| 10 | **Test mode is BEL 20 first 5 + no ETFs + no watchlists** | Brings `rebuild-inventory --test` from ~65 sec to ~4 sec. `get-quotes --test` is 1 ticker (~3 sec). Both still exercise the .info loop and the Wikipedia parser. |
+| 11 | **Portfolio auto-adoption** | Unresolved `Main!Portfolio` entries get a Yahoo lookup. Found → appended as synthetic constituent with `Indexes="Portfolio"`. Not found → error written to `Main` column C of the offending row. Replaces the prior hard-RuntimeError check. Stale errors clear on the next successful run. |
+| 12 | **Parallel .info / prices / watchlists** | `ThreadPoolExecutor` at every layer that's HTTP-bound. .info: 8 workers. Price chunks: 6 workers. Watchlists: 6 workers. Plus a 1.0s inter-chunk sleep removed from `fetch_close_prices` — concurrency cap is the new rate-limiter. |
+| 13 | **No session-passing to yfinance** | yfinance 0.2.x raises `YFDataException` on plain `requests.Session` (it requires curl_cffi for TLS fingerprinting). Pinned by 6 regression tests. NEVER add `session=` to `yf.Ticker` / `yf.download` calls again. |
+| 14 | **Industry column** | Added between Sector and Watchlists in MARKET_COLUMNS. Sourced from yfinance `.info["industry"]`. |
+| 15 | **AutoFilter self-healing on every code touch** | Excel strips openpyxl-set autofilter on manual save. Both `rebuild_inventory` AND `get_quotes` now re-apply Market AutoFilter. Ranking + Currencies sheets re-apply their own. |
+| 16 | **Header re-styling on schema bumps** | When a header cell's VALUE is rewritten by `_layout_market_sheet` / `_ensure_ranking_sheet_openpyxl` / `_ensure_currencies_sheet_openpyxl`, the cell's bold + fill are also re-asserted. Preserves user cosmetics on unchanged cells; ensures new schema-bump cells get styled. |
+| 17 | **InfoCache SQLite (7-day TTL)** | Slow-changing .info fields cached in `stocks_info_cache.sqlite` next to the workbook (gitignored). Schema migrates transparently via `ALTER TABLE ADD COLUMN` when new fields are added. Used by rebuild_inventory only — get_quotes still hits fresh for P/E. |
+| 18 | **Freshness skip in get_quotes** | Rows whose `Last update (UTC)` is within `QUOTE_FRESHNESS_HOURS` (4h) skip the .info call. Prices still refresh every run. Re-runs within the window become near-instant. |
+| 19 | **Cell-based STOP control** | Real Excel button is technically infeasible with synchronous `RunPython`. Form-control checkbox writes TRUE to `Main!B13`; Python polls every 25 tickers and breaks cleanly with partial state. |
+| 20 | **Busy-flag guard against double-clicks** | VBA wrapper sets `Main!B14` TRUE at job start, FALSE on cleanup. `GuardJobStart()` refuses to launch a second job — prevents two parallel rebuilds from clicking too fast. |
+| 21 | **Accounting-comma format on FX rates** | Currencies sheet uses `'_-* #,##0.0000_-;...'` matching Market's EUR price columns, at 4 decimals (2dp would hide intra-week moves). |
 
-## What was built and shipped (commits, in order)
+## What was built in session 02 (11 commits)
 
-The repo has ~35 commits on `main`. The major milestones:
+`5fabbbf` (session 01 end) → `5c90809` (current HEAD), with `v1.0.0` tag at `69d159e`:
 
-### Bug fixes (early session)
-- pandas 3.0 compat: `pd.read_html(StringIO(...))` wrap.
-- BEL 20 ticker extraction: parses "Euronext Brussels:\xa0SYMBOL"; handles APAM on Amsterdam → `.AS`.
-- Excel auto-size loop tripping on NaN under pandas 3.0.
-- `datetime.utcnow()` → `datetime.now(dt.UTC)`.
-- NIKKEI 225 bullet-list scrape (Wikipedia removed the table).
-- Cross-index double-suffix bug (Airbus AIR.PA in DAX, ArcelorMittal MT.AS in CAC40, BT-A in FTSE100).
-- AutoFilter re-apply failure when Market not active sheet.
-- `sheets.add(after=...)` failure when target is a hidden sheet.
+| Commit | Summary |
+|--------|---------|
+| `bb87937` | Test-mode rebuild preserves Market (Monthly winners/losers empty round 1) |
+| `70d2d4f` | Test-mode get_quotes refreshes top 20 rows (round 2) |
+| `9fcbdfd` | Adaptive Owned?=Yes filter on Monthly losers (round 3 — true fix) |
+| `fd0203c` | Cell-based STOP + busy-flag + portfolio validation |
+| `42856b5` | Speedups A+C+F (parallel .info + freshness skip + SQLite cache) |
+| `69d159e` | Auto-adopt unresolved portfolio symbols + max_workers 12→8 |
+| `8a530b2` | Batch 1 attempt: shared Yahoo session + parallel prices + parallel watchlists |
+| `14118e8` | v04: Industry column + AutoFilter on all sheets + **revert** Batch 1 session experiment |
+| `89382a4` | Re-assert Market headers on rebuild + yfinance-session regression tests |
+| `5c90809` | Restyle headers + AutoFilter on get_quotes + comma-style FX format |
+| (tag) | **v1.0.0** annotated tag on `69d159e` |
 
-### Architecture
-- One-row-per-Symbol refactor (`aggregate_constituents`).
-- EuroStoxx 50 added (7th index, multi-exchange).
-- Sector + description fields added from yfinance `.info`.
-- Watchlist rewrite: Yahoo screener (cookie+crumb) + dataroma 4-page scrape + 7-manager activist aggregate.
+## Performance (982 tickers, user's actual workbook)
 
-### Two-jobs + persistent workbook
-- `init-workbook` subcommand (idempotent, cosmetic-preserving).
-- `rebuild-inventory` (Job 1).
-- `get-quotes` (Job 2) with per-row `Last update` / `Last error`.
-- `setup-buttons` subcommand: COM-driven Excel buttons + checkbox + xlwings.conf sheet + VBA auto-import.
+| Job | Session 01 end | Session 02 cold cache | Session 02 warm cache |
+|-----|---------------|------------------------|------------------------|
+| `rebuild-inventory` | ~4–10 min | ~57s | ~10s (cache + watchlist hits) |
+| `get-quotes` | ~5 min | ~50s | ~5s (freshness skip) |
 
-### Workbook polish
-- 38 curated ETFs (per-index + sector-SPDR + country-iShares).
-- Symbol cells hyperlinked to Yahoo Finance.
-- % change columns (`1D %`, `1W %`, `1M %`, `6M %`, `1Y %`, `5Y %`) interleaved with prices.
-- Comma Style on quote/P-E columns, Percent style on `% change` columns.
-- Description column with `wrap_text=False` forced.
-- Main!B5 (TestMode) hidden via `;;;` number format.
-- Help sheet (auto-populated from VERSION_HISTORY).
-- Currencies sheet (EUR/USD/JPY/GBP/CHF history at every lookback).
-- Monthly winners sheet (top 1M gainers with no 1D/1W weakness).
-- Monthly losers sheet (sustained 1M decline; pre-filtered to Owned?=Yes).
-- AutoFilter on Market + Monthly winners + Monthly losers.
-- Cross-index ticker normalization (fixes the AIR.PA.DE / MT.AS.PA / BT.A.L bugs).
-- Schema versioning v01 → v02 → v03.
+## Test pyramid (final state)
 
-### Test pyramid (final state)
-- **132 offline** tests (`pytest`): parsing, computation, openpyxl writes, layout, version logic. ~1.5 sec.
-- **18 integration** tests (`pytest --integration`): live Wikipedia + Yahoo screener + dataroma + FX network. ~30 sec.
-- **11 Excel-COM** tests in `test_xlwings.py` (`pytest --integration test_xlwings.py`): workbook manipulation paths, hidden sheets, AutoFilter resilience, ranking sheet creation, legacy-name migration. Skip automatically when user has Excel open (otherwise `app.quit()` would close it).
-
-### Documentation
-- `README.md` rewritten end-to-end for the two-jobs flow + Troubleshooting section.
-- `CLAUDE.md` rewritten in three batches matching the architectural shifts.
-- `MEMORY.md` with three decision entries (Yahoo deprecation, pandas 3.0 fix, BEL 20 parsing).
-- `vba/stocks_picker.bas` — the VBA module that `setup-buttons` auto-imports.
-
-### Hardening / process
-- Commit cadence rule: after each major change OR every 5 small changes. Tests must pass.
-- Integration tests must also pass for "major" commits.
-- Memory rules saved (Claude project memory):
-  - Don't ask before fetching from the web.
-  - Use WebFetch for one-shot reads when it suffices.
-  - Don't kill Excel without explicit approval.
-  - Respect user cosmetic edits on stocks.xlsm (rule reinforced twice).
-  - xlwings/COM tests must skip when Excel is running.
-  - Kill stray tail.exe processes after Monitor usage (caught a "PC won't sleep" issue).
+- **181 offline** tests (`pytest`): parsing, computation, openpyxl writes, layout, version logic, yfinance-session regression guards, header re-styling, AutoFilter survival.
+- **16 integration** tests (`pytest --integration`): live Wikipedia + Yahoo screener + dataroma + FX network.
+- **14 Excel-COM** tests (`pytest --integration test_xlwings.py`): workbook manipulation, AutoFilter resilience, header re-assertion, ranking-sheet creation, legacy-name migration. Auto-skips when user has Excel open.
+- **1 other**.
+- **Total: 212 passed.**
 
 ## Current state at handoff
 
 | Aspect | State |
 |--------|-------|
-| Last commit | `5fabbbf` — v03 Monthly winners + Losers + Owned? + AutoFilters |
+| Last commit | `5c90809` |
+| First tag | `v1.0.0` at `69d159e` |
 | Latest pushed to GitHub | ✓ |
-| All tests passing | ✓ — 132 offline, 18 integration, 11 Excel-COM (skip when Excel open) |
-| User workbook | `stocks_picker_v02.xlsm` (still on v02 filename despite code at v03) |
-| Workbook contents | Main (portfolio incl. BRK-B), Help (credit line), Market (983 rows + AutoFilter), xlwings.conf. Monthly winners/losers + Currencies will appear after the next `get-quotes` run. |
-| Excel button macros | VBA imported, buttons wired, Test-mode checkbox at B5 |
-| Manual one-time setup completed | ✓ — `xlwings.exe addin install`, VBA Tools → References → xlwings, "Enable Content" on workbook open |
+| All tests passing | ✓ — 212 across three layers |
+| User workbook | `stocks_picker_v03.xlsm` (was v02 — renamed in session 02 to preserve cosmetics) |
+| Workbook contents | Main (9 portfolio entries incl. 4 ETFs), Help (credit line), Market (982 rows, v04 layout — Industry at col F), Monthly winners (50), Monthly losers (50), Currencies (4 pairs × 8 lookbacks), xlwings.conf |
+| SQLite cache | `stocks_info_cache.sqlite` next to workbook (gitignored) |
+| Excel buttons + macros | Wired since session 01; cell-based STOP + busy-flag added session 02 |
 
 ## Outstanding (proposed next steps, not yet done)
 
 In rough priority order:
 
-1. **Rename workbook to `stocks_picker_v03.xlsm`** to match the bumped schema version. One command (close Excel first):
-   ```powershell
-   mv stocks_picker_v02.xlsm stocks_picker_v03.xlsm
-   ```
-   No data loss; `_resolve_workbook` will pick it up automatically.
+1. **Run `get-quotes` once** after pulling the latest. That single run will:
+   - Re-apply Market AutoFilter (Excel likely stripped the prior one)
+   - Re-style any unstyled header cells (e.g. I1 will become bold)
+   - Re-format Currencies cells to accounting-comma style
+   - Refresh prices + P/E
 
-2. **Run `rebuild-inventory` once** so the cross-index normalization fix (commit `498d3ce`) purges the three stale rows from the May 13 run (`BT.A.L`, `AIR.PA.DE`, `MT.AS.PA`).
+2. **Optional `--full` CLI flag.** Right now there's no command-line way to force full mode when the workbook has TestMode=TRUE — you have to either pass nothing (reads B5) or `--test` (forces True). Session 02 worked around this by calling `get_quotes(test_mode=False)` from a one-off Python invocation when needed. Adding a `--full` flag would be a 4-line change.
 
-3. **Run `get-quotes`** to:
-   - Populate Currencies + Monthly winners + Monthly losers sheets.
-   - Pick up the v03 Help-sheet entry.
-   - Verify AutoFilters re-apply cleanly post-rebuild.
+3. **Optional Batch 2 (future speedup, more code).** Discussed in session 02 but not built:
+   - Price-history SQLite cache (similar shape to `InfoCache`) — yesterday's close never changes; only the last few days move. Would cut warm-rerun `get_quotes` from ~50s to ~5s.
+   - Watchlist results cache (24h TTL) — Berkshire's positions don't change between morning and afternoon runs. Same SQLite store.
 
-4. **Performance: parallelize `.info` calls.** Currently sequential, 0.25s sleep each → ~5 min for 983 tickers. Discussed but explicitly NOT built per "do nothing for now" earlier. Approach:
-   - `ThreadPoolExecutor`, 12 workers around `fetch_ticker_info`, exponential backoff on 429s. Expected ~10× speedup.
-   - Optional: `--portfolio-only` flag on `get-quotes` for "just refresh what I own" runs.
+4. **Optional reports** (from the brainstorm in session 02, ranked):
+   - **Sector dashboard** — one row per sector with aggregates. Cheapest insight-per-LoC.
+   - **Owned positions deep-dive** — pre-curated `Owned?=Yes` sheet with totals.
+   - **Drawdown opportunities** — stocks furthest below their 5Y high.
+   - **Weekly index/watchlist diff** — needs snapshot persistence.
+   - **Daily email digest** — Pi-cron friendly, sends to Gmail.
+   - Discuss before implementing.
 
-5. **Job interruptibility.** Discussed but not built. The right approach (after the user corrected my "Excel UI is frozen" claim): a cell-based STOP flag on Main, polled by the `.info` loop every 25 tickers. Cleanly breaks and saves partial state.
-
-6. **Update `CLAUDE.md` for v03.** The doc still describes v02. Should be a single small commit; not blocking anything.
-
-7. **Optional polish** (no urgency):
-   - Test mode runs in 4 seconds for rebuild but Monthly winners/losers now compute from the full 983-row Market — already covered by the v03 batch, so test mode produces meaningful rankings.
-   - Per-stock daily/weekly/monthly % change columns are present; could add a sparkline using openpyxl's image embedding.
-   - Historical FX option (currently uses today's rate for all historical conversions, a deliberate choice).
-   - Additional indexes: FTSE 250, SMI, IBEX 35, AEX, EuroStoxx 600.
-   - Diff against last run (which tickers entered/exited an index or watchlist).
+5. **README + CLAUDE.md** still describe v03. Should mention v04 features (Industry column, accounting-comma FX format, auto-adoption, freshness skip).
 
 ## How to pick this up next time
 
 1. Read `CLAUDE.md` (project rules + non-obvious knowledge).
 2. Read `MEMORY.md` (decision log).
-3. Read this `HANDOFF.md` (what we just did).
-4. `git log --oneline -20` to see recent commits.
-5. Run `pytest` (should be green in ~1.5 sec).
-6. Optionally `pytest --integration` if you want network checks.
-7. Optionally `pytest --integration test_xlwings.py` (close Excel first).
-8. Open `stocks_picker_v02.xlsm` to see current state.
+3. Read this `HANDOFF.md` (what we built across the two sessions).
+4. `git log --oneline -25` + `git tag --list` to see recent commits + the v1.0.0 tag.
+5. Run `pytest` (should be green in ~2 sec, 181 tests).
+6. Optionally `pytest --integration` if you want network checks (16 more).
+7. Optionally `pytest --integration test_xlwings.py` (close Excel first; 14 more).
+8. Open `stocks_picker_v03.xlsm` to see current state.
 
-## Known quirks
+## Known quirks (carried over + new)
 
-- **xlwings VBA import** needs Excel's "Trust access to the VBA project object model" setting enabled (one-time per machine). Otherwise `setup-buttons` falls back to logged instructions for a manual Alt+F11 import.
-- **`tail -f` survives `TaskStop`/timeout** on Windows. After using the Monitor tool, run `tasklist /FI "IMAGENAME eq tail.exe"` and kill stragglers — they keep the PC from sleeping.
-- **`xw.App(visible=False)` can interact badly with an open user Excel session** on some COM version combos. The `test_xlwings.py` fixture refuses to run if Excel is open.
-- **AutoFilter via COM `Range.AutoFilter()` is finicky** about active sheet + headless mode. The helper activates Market briefly inside `ScreenUpdating=False` and catches any failure; AutoFilter is best-effort.
-- **openpyxl can't author a valid `.xlsm` from scratch** (content-type mismatch). `init-workbook` writes `.xlsx`; `setup-buttons` does the `.xlsm` SaveAs via Excel COM.
+From session 01:
+- **xlwings VBA import** needs Excel's "Trust access to the VBA project object model" setting enabled (one-time per machine).
+- **`tail -f` survives `TaskStop`/timeout** on Windows — kill stragglers via `tasklist /FI "IMAGENAME eq tail.exe"` after Monitor use.
+- **`xw.App(visible=False)` can interact badly with an open user Excel session** — `test_xlwings.py` fixture refuses to run if Excel is open.
+- **AutoFilter via COM `Range.AutoFilter()`** is finicky about active sheet; the helper activates Market briefly inside `ScreenUpdating=False`.
+- **openpyxl can't author a valid `.xlsm` from scratch** — `init-workbook` writes `.xlsx`; `setup-buttons` does `.xlsm` SaveAs via COM.
+
+New in session 02:
+- **yfinance 0.2.x requires curl_cffi session** — passing a plain `requests.Session` raises `YFDataException` and silently empties `.info`. The 6 regression tests in `test_stocks_report.py` pin this contract.
+- **Excel strips openpyxl-set `<autoFilter>` on manual save** — every code path that writes data must re-apply Market AutoFilter to self-heal. Ranking + Currencies helpers already do this for their own sheets.
+- **Header cells added on a schema bump need explicit styling** — when MARKET_COLUMNS / RANKING_HEADERS / CURRENCY_HEADERS grows, the new cell's value is written but the styling logic was previously gated on `is_new=True`. Fixed to re-style on every value rewrite.
+- **The SQLite info cache `ALTER TABLE`-migrates** on open. Adding a new field to InfoCache (e.g. v04's `industry` column) is transparent — pre-v04 cache files gain the column on next open with NULL values for old rows.
