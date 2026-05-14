@@ -1802,6 +1802,13 @@ def rebuild_inventory(
     market_ws = wb["Market"]
     cols = {name: i + 1 for i, name in enumerate(MARKET_COLUMNS)}
 
+    # Re-assert the header row so a SCHEMA_VERSION bump (which may add or
+    # rename columns — v04 added Industry at col 6) propagates to existing
+    # workbooks. Without this, get_quotes refuses to run because the layout
+    # validator sees mismatched headers. overwrite=False preserves any
+    # user-set bold/fill/widths on already-correct columns.
+    _layout_market_sheet(market_ws, overwrite=False)
+
     if test_mode:
         # Preserve Market — only update structural columns of rows that
         # already match the test constituents by Symbol. Skip any test row
@@ -1883,6 +1890,30 @@ def rebuild_inventory(
 #   RunPython "import stocks_report; stocks_report.button_rebuild_inventory()"
 # from each macro. The user imports stocks_picker.bas once via Alt+F11, then
 # assigns macros to button shapes via right-click → Assign Macro.
+
+def _xw_ensure_market_headers(market_xw, status: Optional[Callable[[str], None]] = None) -> bool:
+    """Re-assert Market!row 1 against MARKET_COLUMNS via xlwings.
+
+    Sole purpose: propagate a SCHEMA_VERSION header change (e.g. v04
+    added Industry at col 6) to an existing workbook. Only writes if the
+    current header row doesn't already match — preserves user-set
+    bold/fill on already-correct columns.
+
+    Returns True if headers were rewritten, False if already correct.
+    """
+    last_col_letter = get_column_letter(len(MARKET_COLUMNS))
+    existing = market_xw.range(f"A1:{last_col_letter}1").value
+    if not isinstance(existing, list):
+        existing = [existing]
+    while len(existing) < len(MARKET_COLUMNS):
+        existing.append(None)
+    if all(existing[i] == name for i, name in enumerate(MARKET_COLUMNS)):
+        return False
+    if status is not None:
+        status("Refreshing Market header row (schema may have changed)")
+    market_xw.range("A1").value = [list(MARKET_COLUMNS)]
+    return True
+
 
 def _xw_reapply_market_autofilter(market_xw, wb_xw, last_col_letter: str, last_row: int) -> bool:
     """Re-apply Market's AutoFilter spanning the new data extent.
@@ -2151,6 +2182,11 @@ def button_rebuild_inventory() -> None:
             rows.append(row)
 
         sym_col_idx = MARKET_COLUMNS.index("Symbol") + 1
+
+        # Re-assert Market!row 1 so SCHEMA_VERSION bumps (e.g. v04 Industry)
+        # propagate to existing workbooks — same fix as the CLI path.
+        _xw_ensure_market_headers(market, status)
+
         if test_mode:
             # Preserve Market — only update structural columns of rows that
             # already match by Symbol. Keeps the ranking computation (which

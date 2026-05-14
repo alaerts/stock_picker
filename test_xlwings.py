@@ -31,6 +31,7 @@ from stocks_report import (
     _ensure_currencies_sheet_xlwings,
     _ensure_ranking_sheet_xlwings,
     _migrate_monthly_movers_to_winners_xlwings,
+    _xw_ensure_market_headers,
     _xw_last_visible_sheet,
     _xw_reapply_market_autofilter,
     init_workbook,
@@ -233,6 +234,29 @@ def test_ranking_populated_when_market_has_data_post_test_rebuild(workbook_with_
     # First data row of each sheet must be non-empty (A2 = symbol).
     assert win_sheet.range("A2").value is not None
     assert los_sheet.range("A2").value is not None
+
+
+def test_xw_ensure_market_headers_rewrites_pre_v04_layout(workbook_with_hidden_trailing_sheet):
+    """Regression: xlwings rebuild path must re-assert Market!row 1 against
+    MARKET_COLUMNS so SCHEMA_VERSION bumps (e.g. v04 Industry) propagate
+    to existing workbooks. Without this, the get_quotes schema validator
+    blocks the workbook until the user manually edits it."""
+    from openpyxl.utils import get_column_letter
+    wb = workbook_with_hidden_trailing_sheet
+    market = wb.sheets["Market"]
+    # Force a PRE-v04 header layout (no Industry).
+    pre_v04 = [c for c in MARKET_COLUMNS if c != "Industry"]
+    market.range("A1").value = [pre_v04]
+    # Helper detects mismatch and rewrites.
+    assert _xw_ensure_market_headers(market) is True
+    # Headers now exactly match MARKET_COLUMNS.
+    last_letter = get_column_letter(len(MARKET_COLUMNS))
+    actual = market.range(f"A1:{last_letter}1").value
+    if not isinstance(actual, list):
+        actual = [actual]
+    assert actual == list(MARKET_COLUMNS)
+    # Calling again is a no-op (returns False without writing).
+    assert _xw_ensure_market_headers(market) is False
 
 
 def test_migrate_monthly_movers_xlwings_renames(workbook_with_hidden_trailing_sheet):

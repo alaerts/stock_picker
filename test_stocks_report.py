@@ -1671,5 +1671,166 @@ def test_currencies_sheet_openpyxl_applies_autofilter(tmp_path):
     assert ws.auto_filter.ref.startswith("A1:")
 
 
+# ---------------------------------------------------------------------------
+# Regression: yfinance 0.2.x rejects plain requests.Session via YFDataException.
+# Passing one breaks .info / .download silently for ALL tickers. We must never
+# re-introduce session= arguments on yfinance calls. These tests spy on the
+# constructors and assert no session kwarg slips through.
+# ---------------------------------------------------------------------------
+
+def test_fetch_ticker_info_does_not_pass_session_to_yf_ticker(monkeypatch):
+    """If we ever try to pass a requests.Session to yf.Ticker again,
+    yfinance raises YFDataException and every ticker returns empty info.
+    This test pins fetch_ticker_info to the contract: NO session kwarg."""
+    import stocks_report as sr
+    seen_kwargs: list[dict] = []
+
+    class _SpyTicker:
+        def __init__(self, sym, **kw):
+            seen_kwargs.append(kw)
+        @property
+        def info(self):
+            return {"longName": "x", "currency": "USD"}
+
+    monkeypatch.setattr(sr.yf, "Ticker", _SpyTicker)
+    sr.fetch_ticker_info("AAPL")
+    assert seen_kwargs, "yf.Ticker must have been called"
+    for kw in seen_kwargs:
+        assert "session" not in kw, (
+            f"yf.Ticker received session kwarg ({kw!r}) — yfinance 0.2.x "
+            "raises YFDataException on non-curl_cffi sessions and silently "
+            "empties .info. NEVER re-introduce this."
+        )
+
+
+def test_yahoo_lookup_for_adoption_does_not_pass_session(monkeypatch):
+    """Same contract for the portfolio-adoption lookup path."""
+    import stocks_report as sr
+    seen_kwargs: list[dict] = []
+
+    class _SpyTicker:
+        def __init__(self, sym, **kw):
+            seen_kwargs.append(kw)
+        @property
+        def info(self):
+            return {"longName": "x", "regularMarketPrice": 1.0}
+
+    monkeypatch.setattr(sr.yf, "Ticker", _SpyTicker)
+    sr._yahoo_lookup_for_adoption("CSX5.AS")
+    assert seen_kwargs and all("session" not in kw for kw in seen_kwargs), (
+        "_yahoo_lookup_for_adoption must call yf.Ticker without session= "
+        "(yfinance rejects plain requests.Session)"
+    )
+
+
+def test_fetch_close_prices_does_not_pass_session_to_yf_download(monkeypatch):
+    """fetch_close_prices must call yf.download without a session kwarg."""
+    import stocks_report as sr
+    seen_kwargs: list[dict] = []
+
+    def _spy_download(tickers, start, end, **kw):
+        seen_kwargs.append(kw)
+        idx = pd.date_range("2026-05-01", periods=2, freq="D")
+        df = pd.DataFrame({t: [1.0, 2.0] for t in tickers}, index=idx)
+        return pd.concat({"Close": df}, axis=1)
+
+    monkeypatch.setattr(sr.yf, "download", _spy_download)
+    sr.fetch_close_prices(["A", "B"], dt.date(2026, 5, 1), dt.date(2026, 5, 3),
+                          chunk_size=2, max_workers=1)
+    assert seen_kwargs and all("session" not in kw for kw in seen_kwargs), (
+        "yf.download received session kwarg — yfinance rejects "
+        "non-curl_cffi sessions and breaks the price fetch."
+    )
+
+
+def test_fetch_close_prices_does_not_accept_session_kwarg():
+    """The function's signature itself must not expose session=. If somebody
+    adds it back, this test fails immediately (no monkeypatching needed)."""
+    import inspect
+    import stocks_report as sr
+    params = inspect.signature(sr.fetch_close_prices).parameters
+    assert "session" not in params, (
+        "fetch_close_prices grew a session parameter — yfinance rejects "
+        "plain requests.Session. Don't add it back."
+    )
+
+
+def test_fetch_ticker_info_does_not_accept_session_kwarg():
+    """Same signature contract for fetch_ticker_info."""
+    import inspect
+    import stocks_report as sr
+    params = inspect.signature(sr.fetch_ticker_info).parameters
+    assert "session" not in params, (
+        "fetch_ticker_info grew a session parameter — yfinance rejects "
+        "plain requests.Session. Don't add it back."
+    )
+
+
+def test_rebuild_inventory_full_rewrites_market_headers(tmp_path, monkeypatch):
+    """Regression: a full rebuild_inventory must re-assert Market!row 1 so
+    headers track the current MARKET_COLUMNS. v04 added Industry at col 6;
+    if rebuild_inventory left old headers in place, get_quotes would refuse
+    to run (it validates the header row), making the schema bump unusable
+    without a manual init-workbook from scratch."""
+    from openpyxl import Workbook, load_workbook
+    import pandas as pd
+    import stocks_report as sr
+
+    # Build a workbook with a PRE-v04 Market layout (no Industry column).
+    # init_workbook would write the current MARKET_COLUMNS, so we hand-build.
+    path = tmp_path / "stale_layout.xlsx"
+    wb = Workbook()
+    main_ws = wb.active
+    main_ws.title = "Main"
+    # Minimal Main scaffolding for read_portfolio_symbols / read_test_mode etc.
+    main_ws["B5"] = "FALSE"
+    market_ws = wb.create_sheet("Market")
+    OLD_LAYOUT = [c for c in sr.MARKET_COLUMNS if c != "Industry"]
+    for i, name in enumerate(OLD_LAYOUT, 1):
+        market_ws.cell(row=1, column=i, value=name)
+    market_ws.cell(row=2, column=1, value="STALE")
+    wb.save(path)
+
+    fake_constituents = pd.DataFrame(
+        [("AAA.BR", "name a", "BEL20"), ("BBB.BR", "name b", "BEL20")],
+        columns=["Symbol", "Name", "Index"],
+    )
+    monkeypatch.setattr(sr, "get_index_constituents", lambda idx: fake_constituents)
+    monkeypatch.setattr(sr, "get_etfs",
+                        lambda: pd.DataFrame(columns=["Symbol", "Name", "Index"]))
+    monkeypatch.setattr(sr, "fetch_all_watchlists", lambda: {})
+    monkeypatch.setattr(sr, "fetch_all_info_with_cache",
+                        lambda tickers, **kw: ({t: {} for t in tickers}, 0))
+    # Make portfolio adoption a no-op (no Yahoo lookups in the test).
+    monkeypatch.setattr(sr, "resolve_or_adopt_portfolio",
+                        lambda entries, c, write_err: c)
+
+    sr.rebuild_inventory(workbook_path=path, test_mode=False, indexes=["BEL20"],
+                          info_delay=0.0)
+
+    wb2 = load_workbook(path)
+    market2 = wb2["Market"]
+    actual_headers = [market2.cell(row=1, column=i).value
+                      for i in range(1, len(sr.MARKET_COLUMNS) + 1)]
+    assert actual_headers == list(sr.MARKET_COLUMNS), (
+        f"rebuild_inventory left stale headers in place:\n"
+        f"  got      {actual_headers}\n"
+        f"  expected {list(sr.MARKET_COLUMNS)}"
+    )
+    # And the validator (which get_quotes calls first) must now pass.
+    assert sr._validate_market_layout(market2) is None
+
+
+def test_no_get_yahoo_session_export():
+    """The reverted helper must stay reverted. If somebody re-adds
+    get_yahoo_session() it'll be tempting to wire it back into yfinance
+    calls again."""
+    import stocks_report as sr
+    assert not hasattr(sr, "get_yahoo_session"), (
+        "get_yahoo_session is back. The shared-session pattern fundamentally "
+        "doesn't work with yfinance 0.2.x — see commit 14118e8."
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
