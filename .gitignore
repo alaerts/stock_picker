@@ -11,8 +11,10 @@ __pycache__/
 venv/
 env/
 
-# Generated reports
+# Workbooks — personal data (portfolio + cosmetic edits live only on your machine)
 *.xlsx
+*.xlsm
+~$*.xlsm
 stocks_report_*.xlsx
 
 # Run logs
