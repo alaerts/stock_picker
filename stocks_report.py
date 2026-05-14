@@ -822,11 +822,24 @@ class InfoCache:
             "description TEXT, fetched_at REAL NOT NULL)"
         )
         # Lightweight migration: older caches predate the industry column.
+        # Adding the column makes get_fresh work, but rows stored before this
+        # have industry=NULL. The schema-version check below covers that.
         try:
             self._conn.execute("ALTER TABLE info_cache ADD COLUMN industry TEXT")
-            self._conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Cache schema version: when the set of fields stored per row grows,
+        # cached rows from prior versions would return empty values for the
+        # new field on cache hits (the 2026-05-14 "Industry always empty"
+        # bug). Purge them so the next rebuild fetches fresh data.
+        stored_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if stored_version < INFO_CACHE_SCHEMA_VERSION:
+            purged = self._conn.execute("SELECT COUNT(*) FROM info_cache").fetchone()[0]
+            self._conn.execute("DELETE FROM info_cache")
+            self._conn.execute(f"PRAGMA user_version = {INFO_CACHE_SCHEMA_VERSION}")
+            if purged:
+                log.info(f"InfoCache: purged {purged} pre-v{INFO_CACHE_SCHEMA_VERSION} rows "
+                         "(stored without all current fields)")
         self._conn.commit()
 
     def get_fresh(self, tickers: list[str], ttl_seconds: float) -> dict[str, dict]:
@@ -1194,6 +1207,15 @@ QUOTE_FRESHNESS_HOURS = 4.0
 # excluded — it changes daily and gets refreshed by get_quotes anyway.
 INFO_CACHE_FILENAME = "stocks_info_cache.sqlite"
 INFO_CACHE_TTL_DAYS = 7
+# Bump on every change to InfoCache stored fields (e.g. when fetch_ticker_info
+# starts surfacing a new field). On open, if the DB's `PRAGMA user_version`
+# is lower than this constant we purge all rows — they were stored under a
+# schema that didn't include the new field and would otherwise return empty
+# values on cache hits, masking the new column in Market. The 2026-05-14
+# v04 release added `industry`; that was the first version bump.
+#   1 = original (currency / pe / longName / sector / description)
+#   2 = + industry (v04, 2026-05-14)
+INFO_CACHE_SCHEMA_VERSION = 2
 
 # Where button-triggered errors land. Lives next to the workbook so the user
 # can find it without leaving Excel.

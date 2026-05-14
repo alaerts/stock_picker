@@ -1617,8 +1617,14 @@ def test_info_cache_roundtrip_includes_industry(tmp_path):
 
 
 def test_info_cache_handles_legacy_db_without_industry_column(tmp_path):
-    """Pre-v04 cache files don't have the industry column. The migration
-    must add it on the next open, and get_fresh must tolerate NULL values."""
+    """Pre-v04 cache files lack the industry column. Two things must hold:
+
+    1. Opening the cache succeeds — the ALTER TABLE migration adds the
+       column structurally.
+    2. The stored-without-industry row is PURGED via the schema-version
+       check (PRAGMA user_version), not silently returned with industry=""
+       — that's the 2026-05-14 "Industry always empty" bug.
+    """
     import sqlite3
     db = tmp_path / "legacy.sqlite"
     # Simulate an old (pre-v04) cache.
@@ -1630,14 +1636,16 @@ def test_info_cache_handles_legacy_db_without_industry_column(tmp_path):
                  "'Apple', 'Technology', '', ?)", [__import__("time").time()])
     conn.commit()
     conn.close()
-    # Open via InfoCache — migration should ALTER TABLE to add industry.
     import stocks_report as sr
     cache = sr.InfoCache(db)
     try:
         out = cache.get_fresh(["AAPL"], ttl_seconds=86400)
     finally:
         cache.close()
-    assert out["AAPL"]["industry"] == ""  # NULL → empty string
+    # Row purged because PRAGMA user_version was 0; opening InfoCache stamped
+    # it to INFO_CACHE_SCHEMA_VERSION and wiped pre-version rows. Next rebuild
+    # will refetch fresh data including industry.
+    assert out == {}
 
 
 def test_check_market_headers_passes_on_canonical_layout():
@@ -2020,6 +2028,71 @@ def test_help_sheet_self_heal_is_idempotent(tmp_path):
         f"Help sheet grew from {rows_after_first} → {rows_after_second} rows "
         "on a second call — self-heal is not idempotent"
     )
+
+
+def test_info_cache_purges_rows_from_older_schema(tmp_path):
+    """Regression for the 2026-05-14 'Industry always empty' bug.
+
+    When a new field is added to InfoCache (e.g. v04 added `industry`),
+    rows stored under the older schema have NULL for the new field. On
+    cache hits, get_fresh would return those rows with industry="" and
+    the rebuild would write empty Industry cells to Market. The schema
+    version check must purge them so the next rebuild refetches fresh
+    data with the new field populated.
+    """
+    import sqlite3
+    import stocks_report as sr
+    db = tmp_path / "old_schema.sqlite"
+    # Build an "old" cache: rows present but PRAGMA user_version still 0.
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE info_cache (ticker TEXT PRIMARY KEY, currency TEXT, "
+        "trailing_pe REAL, forward_pe REAL, long_name TEXT, sector TEXT, "
+        "industry TEXT, description TEXT, fetched_at REAL NOT NULL)"
+    )
+    import time as _t
+    conn.execute(
+        "INSERT INTO info_cache (ticker, currency, sector, industry, fetched_at) "
+        "VALUES ('AAPL', 'USD', 'Technology', NULL, ?)",
+        [_t.time()],
+    )
+    conn.commit()
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    conn.close()
+    # Open via InfoCache — should purge and stamp current version.
+    cache = sr.InfoCache(db)
+    try:
+        rows_after = cache.get_fresh(["AAPL"], ttl_seconds=86400)
+    finally:
+        cache.close()
+    assert rows_after == {}, "stale-schema row was not purged"
+    # Verify PRAGMA user_version was stamped so the next open is a no-op.
+    conn = sqlite3.connect(str(db))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == sr.INFO_CACHE_SCHEMA_VERSION
+    conn.close()
+
+
+def test_info_cache_does_not_purge_current_schema_rows(tmp_path):
+    """A cache already at the current schema version must NOT be wiped on
+    open — that would defeat the whole purpose of the cache."""
+    import sqlite3
+    import stocks_report as sr
+    db = tmp_path / "current.sqlite"
+    # First open: empty cache gets stamped current.
+    cache = sr.InfoCache(db)
+    cache.put_many({"AAPL": {"currency": "USD", "industry": "Consumer Electronics"}})
+    cache.close()
+    # Verify the version stamp is current.
+    conn = sqlite3.connect(str(db))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == sr.INFO_CACHE_SCHEMA_VERSION
+    assert conn.execute("SELECT COUNT(*) FROM info_cache").fetchone()[0] == 1
+    conn.close()
+    # Re-open: must NOT purge.
+    cache = sr.InfoCache(db)
+    out = cache.get_fresh(["AAPL"], ttl_seconds=86400)
+    cache.close()
+    assert "AAPL" in out
+    assert out["AAPL"]["industry"] == "Consumer Electronics"
 
 
 if __name__ == "__main__":
