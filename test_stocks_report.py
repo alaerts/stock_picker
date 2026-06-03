@@ -562,7 +562,97 @@ def test_ensure_help_sheet_versions_does_not_duplicate(tmp_path):
     assert ws.max_row == rows_after_first, "second call appended duplicate entries"
 
 
-# ---------------------------------------------------------------------------
+def test_help_sheet_self_heal_adds_headers(tmp_path):
+    """If Help sheet does not have 'Version' header at row 3, it should insert it
+    and shift existing version rows down."""
+    from openpyxl import Workbook
+    from stocks_report import _ensure_help_sheet_versions, VERSION_HISTORY
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Help"
+    
+    # Pre-populate some version row at row 3 (without header)
+    ws.cell(row=3, column=1, value="v01")
+    ws.cell(row=3, column=2, value="2026-05-13")
+    ws.cell(row=3, column=3, value="Initial release")
+    
+    _ensure_help_sheet_versions(ws, fresh=False)
+    
+    # Headers must be at row 3
+    assert ws.cell(row=3, column=1).value == "Version"
+    assert ws.cell(row=3, column=2).value == "Date"
+    assert ws.cell(row=3, column=3).value == "Summary of changes"
+    
+    # The pre-existing "v01" row should be shifted down to row 4
+    assert ws.cell(row=4, column=1).value == "v01"
+    assert ws.cell(row=4, column=2).value == "2026-05-13"
+    assert ws.cell(row=4, column=3).value == "Initial release"
+
+
+def test_get_portfolio_error_col_openpyxl(tmp_path):
+    from openpyxl import Workbook
+    from stocks_report import get_portfolio_error_col_openpyxl, PORTFOLIO_HEADER_ROW
+    
+    # Case 1: Headers already exist
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Main"
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=1, value="Symbol")
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=2, value="Notes")
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=3, value="Quantity")
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=4, value="Error")
+    
+    col = get_portfolio_error_col_openpyxl(ws)
+    assert col == 4
+    
+    # Case 2: Headers exist with "Status" instead of "Error"
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=4, value="Status")
+    col = get_portfolio_error_col_openpyxl(ws)
+    assert col == 4
+    
+    # Case 3: Error column doesn't exist, should append to first empty column
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=4).value = None  # clear it
+    ws.cell(row=PORTFOLIO_HEADER_ROW, column=5, value="SomeOther")
+    col = get_portfolio_error_col_openpyxl(ws)
+    # First empty column is 4, it should write "Error" there and return 4
+    assert col == 4
+    assert ws.cell(row=PORTFOLIO_HEADER_ROW, column=4).value == "Error"
+
+
+def test_read_fallback_fx_openpyxl(tmp_path):
+    from openpyxl import Workbook
+    from stocks_report import _read_fallback_fx_openpyxl
+    wb = Workbook()
+    
+    # Create Currencies sheet with some rates
+    cur_ws = wb.create_sheet("Currencies")
+    cur_ws.cell(row=1, column=1, value="Pair")
+    cur_ws.cell(row=1, column=2, value="Today")
+    cur_ws.cell(row=2, column=1, value="EUR/USD")
+    cur_ws.cell(row=2, column=2, value=1.05)
+    cur_ws.cell(row=3, column=1, value="EUR/JPY")
+    cur_ws.cell(row=3, column=2, value=162.5)
+    
+    # Create Main sheet with some rates
+    main_ws = wb.create_sheet("Main")
+    from stocks_report import MAIN_CELLS
+    main_ws[MAIN_CELLS["EurUsd"]] = 1.06  # different value
+    main_ws[MAIN_CELLS["EurJpy"]] = None
+    main_ws[MAIN_CELLS["EurGbp"]] = 0.84
+    
+    fallback = _read_fallback_fx_openpyxl(wb)
+    
+    # USD should be from Currencies (1.05), not Main or default
+    assert fallback["USD"] == 1.05
+    # JPY should be from Currencies (162.5)
+    assert fallback["JPY"] == 162.5
+    # GBP is missing from Currencies, so it should read from Main (0.84)
+    assert fallback["GBP"] == 0.84
+    # CHF is missing from both, so it should use hardcoded default (0.98)
+    assert fallback["CHF"] == 0.98
+
+
+# -----------------------------------------------------------------------------------------------------------
 # Currencies sheet helpers
 # ---------------------------------------------------------------------------
 
@@ -854,7 +944,7 @@ def test_get_quotes_test_mode_populates_ranking_on_unfilled_market(tmp_path, mon
     monkeypatch.setattr(sr, "fetch_close_prices", mock_close_prices)
     monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw:
                         {t: {"trailingPE": 15.0, "forwardPE": 14.0} for t in tickers})
-    monkeypatch.setattr(sr, "get_fx_rates", lambda: {
+    monkeypatch.setattr(sr, "get_fx_rates", lambda *args, **kwargs: {
         "EUR": 1.0, "USD": 1.1, "JPY": 165.0, "GBP": 0.85, "CHF": 1.0,
         "GBp": 0.85,
     })
@@ -936,7 +1026,7 @@ def test_get_quotes_test_mode_skips_owned_filter_when_no_owned_losers(tmp_path, 
     monkeypatch.setattr(sr, "fetch_close_prices",
         lambda tickers, *a, **kw: pd.concat({t: pd.Series([100]*399 + [95], index=dates) for t in tickers}, axis=1))
     monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw: {t: {} for t in tickers})
-    monkeypatch.setattr(sr, "get_fx_rates", lambda: {"EUR": 1.0, "GBp": 0.85, "USD": 1.1, "JPY": 165, "GBP": 0.85, "CHF": 1.0})
+    monkeypatch.setattr(sr, "get_fx_rates", lambda *args, **kwargs: {"EUR": 1.0, "GBp": 0.85, "USD": 1.1, "JPY": 165, "GBP": 0.85, "CHF": 1.0})
     monkeypatch.setattr(sr, "get_fx_history",
         lambda: {ccy: pd.Series(dtype=float) for ccy in ("USD","JPY","GBP","CHF")})
 
@@ -985,7 +1075,7 @@ def test_get_quotes_test_mode_applies_owned_filter_when_owned_losers_present(tmp
     monkeypatch.setattr(sr, "fetch_close_prices",
         lambda tickers, *a, **kw: pd.concat({t: pd.Series([100]*399 + [95], index=dates) for t in tickers}, axis=1))
     monkeypatch.setattr(sr, "fetch_all_info", lambda tickers, **kw: {t: {} for t in tickers})
-    monkeypatch.setattr(sr, "get_fx_rates", lambda: {"EUR": 1.0, "GBp": 0.85, "USD": 1.1, "JPY": 165, "GBP": 0.85, "CHF": 1.0})
+    monkeypatch.setattr(sr, "get_fx_rates", lambda *args, **kwargs: {"EUR": 1.0, "GBp": 0.85, "USD": 1.1, "JPY": 165, "GBP": 0.85, "CHF": 1.0})
     monkeypatch.setattr(sr, "get_fx_history",
         lambda: {ccy: pd.Series(dtype=float) for ccy in ("USD","JPY","GBP","CHF")})
 
@@ -1945,7 +2035,7 @@ def test_get_quotes_applies_market_autofilter(tmp_path, monkeypatch):
     wb.save(path)
 
     # Stub network paths so test runs fast/offline
-    monkeypatch.setattr(sr, "get_fx_rates", lambda: {"EUR": 1.0, "USD": 1.1, "JPY": 180.0,
+    monkeypatch.setattr(sr, "get_fx_rates", lambda *args, **kwargs: {"EUR": 1.0, "USD": 1.1, "JPY": 180.0,
                                                        "GBP": 0.85, "CHF": 0.95, "GBp": 0.85})
     monkeypatch.setattr(sr, "get_fx_history", lambda: {})
     monkeypatch.setattr(sr, "fetch_close_prices",

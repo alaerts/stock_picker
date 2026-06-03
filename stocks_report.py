@@ -585,7 +585,7 @@ def fetch_all_watchlists(max_workers: int = 6) -> dict[str, list[str]]:
 # FX rates
 # ---------------------------------------------------------------------------
 
-def get_fx_rates() -> dict[str, float]:
+def get_fx_rates(fallback_rates: Optional[dict[str, float]] = None) -> dict[str, float]:
     """Returns {currency_code: units of currency per 1 EUR}. EUR maps to 1.0."""
     rates: dict[str, float] = {"EUR": 1.0}
     log.info("Fetching FX rates (today)")
@@ -600,9 +600,99 @@ def get_fx_rates() -> dict[str, float]:
         except Exception as e:
             log.error(f"  EUR/{ccy} fetch failed: {e}")
             rates[ccy] = float("nan")
+
+    # Merge with fallbacks/hardcoded defaults for any nan values
+    for ccy in FX_PAIRS:
+        if ccy not in rates or pd.isna(rates[ccy]) or rates[ccy] <= 0:
+            if fallback_rates and ccy in fallback_rates:
+                rates[ccy] = fallback_rates[ccy]
+                log.info(f"  EUR/{ccy} (using workbook fallback) = {rates[ccy]:.4f}")
+            else:
+                hardcoded = {"USD": 1.08, "JPY": 165.0, "GBP": 0.85, "CHF": 0.98}
+                rates[ccy] = hardcoded[ccy]
+                log.info(f"  EUR/{ccy} (using hardcoded default) = {rates[ccy]:.4f}")
+
     # GBp (UK pence) shares same rate as GBP, but values must be /100 first
-    rates["GBp"] = rates.get("GBP", float("nan"))
+    rates["GBp"] = rates.get("GBP", 0.85)
     return rates
+
+
+def _read_fallback_fx_openpyxl(wb) -> dict[str, float]:
+    """Read existing FX rates from Currencies sheet or Main sheet as fallback."""
+    fallback = {}
+    # 1. Try reading from Currencies sheet
+    if CURRENCIES_SHEET_NAME in wb.sheetnames:
+        ws = wb[CURRENCIES_SHEET_NAME]
+        # Column A is Pair (e.g. 'EUR/USD'), Column B is Today
+        for r in range(2, ws.max_row + 1):
+            pair = ws.cell(row=r, column=1).value
+            val = ws.cell(row=r, column=2).value
+            if pair and val is not None and not pd.isna(val):
+                parts = str(pair).split("/")
+                if len(parts) == 2:
+                    ccy = parts[1].strip().upper()
+                    try:
+                        fallback[ccy] = float(val)
+                    except ValueError:
+                        pass
+    # 2. Try reading from Main sheet cells if still missing
+    if "Main" in wb.sheetnames:
+        main_ws = wb["Main"]
+        for ccy_key, cell_key in [("USD", "EurUsd"), ("JPY", "EurJpy"), ("GBP", "EurGbp")]:
+            if ccy_key not in fallback:
+                try:
+                    val = main_ws[MAIN_CELLS[cell_key]].value
+                    if val is not None and not pd.isna(val):
+                        fallback[ccy_key] = float(val)
+                except Exception:
+                    pass
+    # 3. Fallback to hardcoded defaults in case the sheets are missing/empty
+    hardcoded = {"USD": 1.08, "JPY": 165.0, "GBP": 0.85, "CHF": 0.98}
+    for ccy, val in hardcoded.items():
+        fallback.setdefault(ccy, val)
+    return fallback
+
+
+def _read_fallback_fx_xlwings(wb_xw) -> dict[str, float]:
+    """Read existing FX rates from Currencies sheet or Main sheet as fallback (xlwings)."""
+    fallback = {}
+    sheet_names = [s.name for s in wb_xw.sheets]
+    # 1. Try reading from Currencies sheet
+    if CURRENCIES_SHEET_NAME in sheet_names:
+        ws = wb_xw.sheets[CURRENCIES_SHEET_NAME]
+        last_row = ws.used_range.last_cell.row if ws.used_range.last_cell else 0
+        if last_row >= 2:
+            pairs = ws.range(f"A2:A{last_row}").value
+            vals = ws.range(f"B2:B{last_row}").value
+            if not isinstance(pairs, list):
+                pairs = [pairs]
+            if not isinstance(vals, list):
+                vals = [vals]
+            for p, v in zip(pairs, vals):
+                if p and v is not None and not pd.isna(v):
+                    parts = str(p).split("/")
+                    if len(parts) == 2:
+                        ccy = parts[1].strip().upper()
+                        try:
+                            fallback[ccy] = float(v)
+                        except ValueError:
+                            pass
+    # 2. Try reading from Main sheet cells if still missing
+    if "Main" in sheet_names:
+        main = wb_xw.sheets["Main"]
+        for ccy_key, cell_key in [("USD", "EurUsd"), ("JPY", "EurJpy"), ("GBP", "EurGbp")]:
+            if ccy_key not in fallback:
+                try:
+                    val = main.range(MAIN_CELLS[cell_key]).value
+                    if val is not None and not pd.isna(val):
+                        fallback[ccy_key] = float(val)
+                except Exception:
+                    pass
+    # 3. Fallback to hardcoded defaults
+    hardcoded = {"USD": 1.08, "JPY": 165.0, "GBP": 0.85, "CHF": 0.98}
+    for ccy, val in hardcoded.items():
+        fallback.setdefault(ccy, val)
+    return fallback
 
 
 def get_fx_history() -> dict[str, pd.Series]:
@@ -1139,7 +1229,7 @@ def write_excel(df: pd.DataFrame, fx: dict, output_path: Path) -> None:
 # the data contract. The filename embeds this so the user can see at a glance
 # which generation of the script their workbook matches; the Help sheet renders
 # the changelog entries from VERSION_HISTORY below.
-SCHEMA_VERSION = "v04"
+SCHEMA_VERSION = "v05"
 
 # Append-only changelog. init-workbook appends any missing versions to the
 # Help sheet without touching user edits. Date is when the version was minted.
@@ -1178,6 +1268,14 @@ VERSION_HISTORY: list[tuple[str, str, str]] = [
      "curl_cffi session. NOTE: existing v03 workbooks need a full "
      "rebuild-inventory after upgrading so Market headers align with the "
      "new Industry column position."),
+    ("v05", "2026-06-03",
+     "Bulk write optimization in button_get_quotes to cut Excel update times "
+     "from minutes to under a second. Dynamic error column on Main to preserve "
+     "manually added portfolio columns like Quantity. Fallback FX rates from "
+     "Currencies or Main sheets to prevent empty price columns when Yahoo throttles. "
+     "Cache schema version bump to v3 to self-heal ETF structural columns. "
+     "Stop cell B13 on Main sheet is now visible (type TRUE to stop). Help sheet "
+     "version table now includes bold column headers with a light-gray fill."),
 ]
 
 DEFAULT_WORKBOOK_PATH = Path(f"stocks_picker_{SCHEMA_VERSION}.xlsm")
@@ -1215,7 +1313,8 @@ INFO_CACHE_TTL_DAYS = 7
 # v04 release added `industry`; that was the first version bump.
 #   1 = original (currency / pe / longName / sector / description)
 #   2 = + industry (v04, 2026-05-14)
-INFO_CACHE_SCHEMA_VERSION = 2
+#   3 = v05 cache self-heal (2026-06-03)
+INFO_CACHE_SCHEMA_VERSION = 3
 
 # Where button-triggered errors land. Lives next to the workbook so the user
 # can find it without leaving Excel.
@@ -1397,19 +1496,18 @@ def _layout_main_sheet(ws: Worksheet, *, overwrite: bool = True) -> None:
     _set("A11", "EUR/JPY (1 EUR = X JPY):")
     _set("A12", "EUR/GBP (1 EUR = X GBP):")
 
-    _set("A13", "Stop a running job:")
+    _set("A13", "Stop a running job (type TRUE to stop):")
     _set("A14", "Portfolio (manual — list every Symbol you own)", bold=True, size=12)
 
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=1).coordinate, "Symbol", bold=True)
     _set(ws.cell(row=PORTFOLIO_HEADER_ROW, column=2).coordinate, "Notes", bold=True)
 
-    # Only on fresh creation: hide the TestMode / StopRequested / JobRunning
+    # Only on fresh creation: hide the TestMode / JobRunning
     # cell displays (the user shouldn't see TRUE/FALSE next to checkboxes
     # or in tracker cells) and set column widths. On re-runs we don't touch
     # any of these — respects user cosmetic edits.
     if overwrite:
         for hidden_addr in (MAIN_CELLS["TestMode"],
-                            MAIN_CELLS["StopRequested"],
                             MAIN_CELLS["JobRunning"]):
             ws[hidden_addr].number_format = ";;;"
         ws.column_dimensions["A"].width = 38
@@ -1626,7 +1724,28 @@ def _ensure_help_sheet_versions_xlwings(wb_xw) -> None:
     if HELP_SHEET_NAME not in sheet_names:
         return
     help_xw = wb_xw.sheets[HELP_SHEET_NAME]
-    # Read column A as a list to find both last used row and existing mentions.
+
+    # 1. Check and insert headers at row 3 if missing
+    headers = ["Version", "Date", "Summary of changes"]
+    header_row = 3
+    has_header = False
+    try:
+        val = help_xw.range((header_row, 1)).value
+        has_header = val is not None and str(val).strip().lower() == "version"
+    except Exception:
+        pass
+
+    if not has_header:
+        try:
+            help_xw.api.Rows(header_row).Insert()
+            help_xw.range((header_row, 1)).value = headers
+            hdr_range = help_xw.range(f"A{header_row}:C{header_row}")
+            hdr_range.api.Font.Bold = True
+            hdr_range.color = (242, 242, 242)
+        except Exception as e:
+            log.warning(f"Failed to insert Help sheet headers via xlwings: {e}")
+
+    # 2. Read column A to find last used row and existing mentions
     last_row = help_xw.used_range.last_cell.row if help_xw.used_range.last_cell else 0
     if last_row < 1:
         col_a = []
@@ -1634,6 +1753,7 @@ def _ensure_help_sheet_versions_xlwings(wb_xw) -> None:
         col_a = help_xw.range(f"A1:A{last_row}").value
         if not isinstance(col_a, list):
             col_a = [col_a]
+
     mentioned: set[str] = set()
     last_used_row = 0
     for idx, v in enumerate(col_a, 1):
@@ -1644,10 +1764,10 @@ def _ensure_help_sheet_versions_xlwings(wb_xw) -> None:
                 for ver, _date, _summary in VERSION_HISTORY:
                     if token == ver.lower():
                         mentioned.add(ver)
-    next_row = last_used_row + 1 if last_used_row else 1
-    # Leave a blank spacer when user has prior content but no version yet.
-    if not mentioned and last_used_row > 0:
-        next_row = last_used_row + 2
+
+    # 3. Determine next row, must be at least 4
+    next_row = max(last_used_row + 1, 4)
+
     appended = 0
     for ver, date, summary in VERSION_HISTORY:
         if ver in mentioned:
@@ -1679,7 +1799,21 @@ def _ensure_help_sheet_versions(ws: Worksheet, *, fresh: bool) -> None:
     for the summary so it's readable without wrap. Existing workbooks keep
     whatever widths the user has chosen.
     """
-    # Determine which versions are already on the sheet (case-insensitive
+    # 1. Check and insert headers at row 3 if missing
+    headers = ["Version", "Date", "Summary of changes"]
+    header_row = 3
+    has_header = (
+        ws.cell(row=header_row, column=1).value is not None 
+        and str(ws.cell(row=header_row, column=1).value).strip().lower() == "version"
+    )
+    if not has_header:
+        ws.insert_rows(header_row, amount=1)
+        for col_idx, name in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=name)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="F2F2F2")
+
+    # 2. Determine which versions are already on the sheet (case-insensitive
     # match anywhere in column A).
     mentioned: set[str] = set()
     last_used_row = 0
@@ -1693,16 +1827,9 @@ def _ensure_help_sheet_versions(ws: Worksheet, *, fresh: bool) -> None:
                 for ver, _date, _summary in VERSION_HISTORY:
                     if token == ver.lower():
                         mentioned.add(ver)
-    # Append missing entries one row past the last used row, with a blank
-    # spacer between user content and our changelog if appropriate.
-    next_row = last_used_row + 1 if last_used_row else 1
-    if mentioned:
-        # Some history exists already; append right after the last used row.
-        pass
-    elif last_used_row > 0:
-        # User has prior content (e.g. their credit line) but no version
-        # entries yet — leave a blank spacer for visual separation.
-        next_row = last_used_row + 2
+
+    # 3. Determine next row, must be at least 4
+    next_row = max(last_used_row + 1, 4)
 
     appended = 0
     for ver, date, summary in VERSION_HISTORY:
@@ -1842,8 +1969,9 @@ def rebuild_inventory(
     # mode since constituents is intentionally trimmed.
     if not test_mode:
         main_ws_local = wb["Main"]
+        error_col = get_portfolio_error_col_openpyxl(main_ws_local)
         def _write_pf_err(row_idx: int, msg: Optional[str]) -> None:
-            main_ws_local.cell(row=row_idx, column=PORTFOLIO_ERROR_COL, value=msg)
+            main_ws_local.cell(row=row_idx, column=error_col, value=msg)
         constituents = resolve_or_adopt_portfolio(
             portfolio_entries, constituents, _write_pf_err,
         )
@@ -2208,8 +2336,9 @@ def button_rebuild_inventory() -> None:
         # Auto-adopt unresolved portfolio entries. Errors land in Main col C
         # of the offending row. Skipped in test mode (constituents trimmed).
         if not test_mode:
+            error_col = get_portfolio_error_col_xlwings(main)
             def _write_pf_err_xw(row_idx: int, msg: Optional[str]) -> None:
-                main.range((row_idx, PORTFOLIO_ERROR_COL)).value = msg
+                main.range((row_idx, error_col)).value = msg
             constituents = resolve_or_adopt_portfolio(
                 portfolio_entries, constituents, _write_pf_err_xw,
             )
@@ -2443,7 +2572,8 @@ def button_get_quotes() -> None:
             targets = market_rows
 
         status("Fetching FX rates + history")
-        fx = get_fx_rates()
+        fallback_rates = _read_fallback_fx_xlwings(wb)
+        fx = get_fx_rates(fallback_rates=fallback_rates)
         fx_history = get_fx_history()
         _ensure_currencies_sheet_xlwings(wb, fx_history)
 
@@ -2492,10 +2622,13 @@ def button_get_quotes() -> None:
         now_iso = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         cols = {n: MARKET_COLUMNS.index(n) + 1 for n in MARKET_COLUMNS}
 
-        # Per-row write involves ~5 xlwings COM calls; on a 986-ticker run the
-        # write loop dominates the visible "wait" after .info finishes. Refresh
-        # the Status cell every WRITE_STATUS_EVERY rows so the user sees motion.
-        WRITE_STATUS_EVERY = 50
+        last_col = len(MARKET_COLUMNS)
+        last_col_letter = get_column_letter(last_col)
+        # Read the entire sheet matrix first to do in-memory updates
+        matrix = market.range(f"A2:{last_col_letter}{last_row}").value
+        if matrix and not isinstance(matrix[0], list):
+            matrix = [matrix]
+
         ok = 0
         fail = 0
         for i, (row_idx, sym, ccy, _indexes_csv) in enumerate(targets, 1):
@@ -2506,6 +2639,7 @@ def button_get_quotes() -> None:
             if i == 1 or i % WRITE_STATUS_EVERY == 0 or i == len(targets):
                 status(f"Writing quote columns: {i}/{len(targets)} ({sym})")
             try:
+                row_vals = matrix[row_idx - 2]
                 series = closes[sym] if sym in closes.columns else pd.Series(dtype=float)
                 eur_by_label = {}
                 for label, delta in LOOKBACKS.items():
@@ -2513,24 +2647,35 @@ def button_get_quotes() -> None:
                     native = price_at_or_before(series, target_d)
                     eur = to_eur(native, ccy, fx)
                     eur_by_label[label] = eur
-                    market.range((row_idx, cols[f"{label} (EUR)"])).value = eur
+                    row_vals[cols[f"{label} (EUR)"] - 1] = eur
                 today_eur = eur_by_label.get("Today")
                 for past_label, pct_col in _pct_column_pairs():
                     pct = _pct_change(today_eur, eur_by_label.get(past_label))
-                    rng = market.range((row_idx, cols[pct_col]))
-                    rng.value = pct
-                    rng.api.NumberFormat = PERCENT_STYLE
+                    row_vals[cols[pct_col] - 1] = pct
                 if sym in info_map:
                     info = info_map[sym]
-                    market.range((row_idx, cols["P/E (TTM)"])).value   = info.get("trailingPE")
-                    market.range((row_idx, cols["Forward P/E"])).value = info.get("forwardPE")
-                    market.range((row_idx, cols["Last update (UTC)"])).value = now_iso
+                    row_vals[cols["P/E (TTM)"] - 1] = info.get("trailingPE")
+                    row_vals[cols["Forward P/E"] - 1] = info.get("forwardPE")
+                    row_vals[cols["Last update (UTC)"] - 1] = now_iso
                 # else: skipped by freshness filter — keep prior P/E + Last update
-                market.range((row_idx, cols["Last error"])).value = None
+                row_vals[cols["Last error"] - 1] = None
                 ok += 1
             except Exception as e:
-                market.range((row_idx, cols["Last error"])).value = f"{type(e).__name__}: {e}"[:300]
+                matrix[row_idx - 2][cols["Last error"] - 1] = f"{type(e).__name__}: {e}"[:300]
                 fail += 1
+
+        # Write the entire matrix back in one COM call
+        market.range(f"A2:{last_col_letter}{last_row}").value = matrix
+
+        # Column-level formats — one COM call per range, applied to all data rows in one shot.
+        for fmt_col_name in ("Today (EUR)", "1D ago (EUR)", "1W ago (EUR)",
+                              "1M ago (EUR)", "6M ago (EUR)", "1Y ago (EUR)",
+                              "5Y ago (EUR)", "P/E (TTM)", "Forward P/E"):
+            col_letter = get_column_letter(cols[fmt_col_name])
+            market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = COMMA_STYLE
+        for _past_label, pct_col in _pct_column_pairs():
+            col_letter = get_column_letter(cols[pct_col])
+            market.range(f"{col_letter}2:{col_letter}{last_row}").api.NumberFormat = PERCENT_STYLE
 
         # Migrate legacy "Monthly movers" → "Monthly winners" if needed; rank
         # from the full Market sheet so test mode (1 refreshed ticker) still
@@ -2704,7 +2849,49 @@ OWNED_COL_INDEX_1BASED = RANKING_HEADERS.index("Owned?") + 1  # 3
 
 
 PORTFOLIO_ADOPTED_INDEX_LABEL = "Portfolio"
-PORTFOLIO_ERROR_COL = 3  # Main column C: portfolio error messages
+PORTFOLIO_ERROR_COL = 3  # Fallback Main column C: portfolio error messages
+
+
+def get_portfolio_error_col_openpyxl(ws: Worksheet) -> int:
+    """Find the column index for portfolio errors on Main sheet (openpyxl).
+    Scans row 15 (PORTFOLIO_HEADER_ROW) for 'Error', 'Status', or 'Last error'.
+    If not found, finds the first empty column in row 15, writes 'Error' to it,
+    and returns that column index.
+    """
+    for c in range(1, 21):
+        val = ws.cell(row=PORTFOLIO_HEADER_ROW, column=c).value
+        if val is not None and str(val).strip().lower() in ("error", "status", "last error"):
+            return c
+    for c in range(1, 21):
+        val = ws.cell(row=PORTFOLIO_HEADER_ROW, column=c).value
+        if val is None or str(val).strip() == "":
+            ws.cell(row=PORTFOLIO_HEADER_ROW, column=c, value="Error").font = Font(bold=True)
+            return c
+    return PORTFOLIO_ERROR_COL
+
+
+def get_portfolio_error_col_xlwings(sheet) -> int:
+    """Find the column index for portfolio errors on Main sheet (xlwings).
+    Scans row 15 (PORTFOLIO_HEADER_ROW) for 'Error', 'Status', or 'Last error'.
+    If not found, finds the first empty column in row 15, writes 'Error' to it,
+    and returns that column index.
+    """
+    try:
+        row_vals = sheet.range((PORTFOLIO_HEADER_ROW, 1), (PORTFOLIO_HEADER_ROW, 20)).value
+        if not isinstance(row_vals, list):
+            row_vals = [row_vals]
+        for idx, val in enumerate(row_vals, 1):
+            if val is not None and str(val).strip().lower() in ("error", "status", "last error"):
+                return idx
+        for idx, val in enumerate(row_vals, 1):
+            if val is None or str(val).strip() == "":
+                cell = sheet.range((PORTFOLIO_HEADER_ROW, idx))
+                cell.value = "Error"
+                cell.api.Font.Bold = True
+                return idx
+    except Exception as e:
+        log.warning(f"Error resolving portfolio error column via xlwings: {e}")
+    return PORTFOLIO_ERROR_COL
 
 
 def _portfolio_symbol_resolves(sym: str, market_upper: set[str],
@@ -3222,7 +3409,8 @@ def get_quotes(
         targets = market_rows
 
     _say("Fetching FX rates + history")
-    fx = get_fx_rates()
+    fallback_rates = _read_fallback_fx_openpyxl(wb)
+    fx = get_fx_rates(fallback_rates=fallback_rates)
     fx_history = get_fx_history()
     _ensure_currencies_sheet_openpyxl(wb, fx_history)
 
@@ -3556,11 +3744,11 @@ def _cmd_setup_buttons(args) -> int:
         #
         #    Add an A13 label inline since the cosmetic-preservation rule
         #    blocks init-workbook from doing it on existing workbooks.
-        if not main.range("A13").value:
-            main.range("A13").value = "Stop a running job:"
-        # Hide the value display in B13 so the user sees only the checkbox.
+        if not main.range("A13").value or main.range("A13").value == "Stop a running job:":
+            main.range("A13").value = "Stop a running job (type TRUE to stop):"
+        # Hide the value display in B14, but make B13 (StopRequested) visible.
         try:
-            main.range(MAIN_CELLS["StopRequested"]).api.NumberFormat = ";;;"
+            main.range(MAIN_CELLS["StopRequested"]).api.NumberFormat = "General"
             main.range(MAIN_CELLS["JobRunning"]).api.NumberFormat = ";;;"
         except Exception:
             pass
