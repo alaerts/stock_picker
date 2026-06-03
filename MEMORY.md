@@ -1,5 +1,20 @@
 # MEMORY.md — Daily Multi-Index Stock Report
 
+## Session Summary, 2026-06-03
+**Worked on:** Planned bulk write optimization, manual portfolio column preservation, FX rate fallback, cache version bump, and Help sheet table headers.
+**Completed:**
+- Created detailed `implementation_plan.md` addressing all 5 original user requests + 3 new fixes.
+- Ran `get-quotes` in test mode to verify baseline functionality.
+- Diagnosed the cause of empty price columns (FX fetch failure due to Yahoo rate limits).
+- Diagnosed the cause of manual column wiping (hardcoded `PORTFOLIO_ERROR_COL = 3` clearing column C on successful runs).
+- Diagnosed ETF gibberish columns (cache corruption/shifting).
+**In progress:** None (paused for future session per user request).
+**Decisions made:**
+- **Dynamic Error Column**: Use dynamic column lookup for portfolio errors on `Main` to preserve manual columns (`Quantity`, `Buy price`, etc.).
+- **FX Rate Fallback**: Read the last successful FX rates from the `Currencies`/`Main` sheet or use hardcoded defaults if yfinance fails.
+- **Cache version bump**: Bump `INFO_CACHE_SCHEMA_VERSION` to `3` to force a clean cache purge on the next run and self-heal ETF gibberish.
+**Next session:** Execute the approved `implementation_plan.md` in `stocks_report.py` and `test_stocks_report.py`.
+
 ## Session Summary, 2026-05-14
 **Worked on:** Performance, polish, and a first tagged release on top of the v03 architecture from session 01. Session ran 2026-05-13 → 2026-05-14 across 11 commits.
 
