@@ -31,7 +31,8 @@ stocks_info_cache.sqlite-journal
 .DS_Store
 .vscode/
 .idea/
-.claude/  # all Claude Code local session state (locks, worktrees, settings)
+# all Claude Code local session state (locks, worktrees, settings)
+.claude/
 
 # Personal scratch / notes — not for the public repo
 NEW_FEATURES.md
