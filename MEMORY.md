@@ -1,19 +1,23 @@
 # MEMORY.md — Daily Multi-Index Stock Report
 
 ## Session Summary, 2026-06-03
-**Worked on:** Planned bulk write optimization, manual portfolio column preservation, FX rate fallback, cache version bump, and Help sheet table headers.
+**Worked on:** Implemented bulk write optimization, manual portfolio column preservation, FX rate fallback, cache version bump, visible stop cell, and Help sheet table headers.
 **Completed:**
-- Created detailed `implementation_plan.md` addressing all 5 original user requests + 3 new fixes.
-- Ran `get-quotes` in test mode to verify baseline functionality.
-- Diagnosed the cause of empty price columns (FX fetch failure due to Yahoo rate limits).
-- Diagnosed the cause of manual column wiping (hardcoded `PORTFOLIO_ERROR_COL = 3` clearing column C on successful runs).
-- Diagnosed ETF gibberish columns (cache corruption/shifting).
-**In progress:** None (paused for future session per user request).
+- Implemented bulk write optimization in `button_get_quotes` using list-of-lists memory updates to reduce COM writes to sub-second.
+- Implemented dynamic portfolio error column detection on `Main` to preserve custom manual columns (e.g. `Quantity`).
+- Implemented FX rate fallback to read from `Currencies` / `Main` sheets or default values (preventing empty price columns under Yahoo throttle).
+- Bumped `INFO_CACHE_SCHEMA_VERSION` to `3` to automatically purge stale cache records and heal ETF columns.
+- Made stop cell `B13` visible and changed label in `A13` to `"Stop a running job (type TRUE to stop):"`.
+- Added styled headers `["Version", "Date", "Summary of changes"]` on row 3 of `Help` sheet and shifted pre-existing versions.
+- Added comprehensive unit tests in `test_stocks_report.py` and verified all 212 tests pass.
+**In progress:** None.
 **Decisions made:**
+- **In-Memory Write**: Read/write quotes in one single COM call in `button_get_quotes` and apply styles column-wide.
 - **Dynamic Error Column**: Use dynamic column lookup for portfolio errors on `Main` to preserve manual columns (`Quantity`, `Buy price`, etc.).
 - **FX Rate Fallback**: Read the last successful FX rates from the `Currencies`/`Main` sheet or use hardcoded defaults if yfinance fails.
 - **Cache version bump**: Bump `INFO_CACHE_SCHEMA_VERSION` to `3` to force a clean cache purge on the next run and self-heal ETF gibberish.
-**Next session:** Execute the approved `implementation_plan.md` in `stocks_report.py` and `test_stocks_report.py`.
+- **Styled Help Headers**: Insert bold, light-gray filled (`F2F2F2`) table headers at row 3 on Help sheet.
+**Next session:** Discuss extension ideas (e.g. per-stock percent change columns, daily email digest) or local task scheduler setup.
 
 ## Session Summary, 2026-05-14
 **Worked on:** Performance, polish, and a first tagged release on top of the v03 architecture from session 01. Session ran 2026-05-13 → 2026-05-14 across 11 commits.
