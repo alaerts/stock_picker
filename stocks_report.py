@@ -2506,6 +2506,7 @@ def button_get_quotes() -> None:
     main = wb.sheets["Main"]
     market = wb.sheets["Market"]
     status = _xw_status(main)
+    WRITE_STATUS_EVERY = 50
 
     try:
         _xw_clear_stop_requested(main)  # reset stale STOP flag
