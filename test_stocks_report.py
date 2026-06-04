@@ -2283,5 +2283,56 @@ def test_read_market_records_openpyxl_surfaces_pe_and_watchlists(tmp_path):
     assert records[0]["watchlists"] == "Berkshire, 52w highs"
 
 
+def test_no_undefined_variables():
+    """Verify that there are no undefined variables (NameErrors) in stocks_report.py
+    using Python's standard symtable module.
+    """
+    import symtable
+    import builtins
+    from pathlib import Path
+    
+    filepath = Path(__file__).parent / "stocks_report.py"
+    with open(filepath, "r", encoding="utf-8") as f:
+        code = f.read()
+    
+    table = symtable.symtable(code, str(filepath), "exec")
+    
+    # Get all globals (symbols defined or imported at module level)
+    globals_set = {sym.get_name() for sym in table.get_symbols() if sym.is_local() or sym.is_assigned() or sym.is_imported()}
+    builtins_set = set(dir(builtins))
+    # Python module-level special variables
+    special_globals = {"__file__", "__name__", "__doc__", "__package__", "__loader__", "__spec__", "__annotations__"}
+    
+    errors = []
+    
+    def inspect_scope(scope, parent_locals=None):
+        if parent_locals is None:
+            parent_locals = set()
+            
+        # Get all local symbols in the current scope
+        current_locals = {sym.get_name() for sym in scope.get_symbols() if sym.is_local() or sym.is_parameter() or sym.is_imported()}
+        
+        # All names that are valid in this scope
+        all_available = current_locals | parent_locals | globals_set | builtins_set | special_globals
+        
+        # Check symbols in this scope
+        for symbol in scope.get_symbols():
+            sym_name = symbol.get_name()
+            if symbol.is_referenced():
+                # If a name is referenced, it must be available
+                if sym_name not in all_available:
+                    errors.append(f"Function/Scope {scope.get_name()} at line {scope.get_lineno()}: undefined name {sym_name!r}")
+        
+        # Recurse into children
+        new_parent_locals = parent_locals | current_locals
+        for child in scope.get_children():
+            inspect_scope(child, new_parent_locals)
+            
+    inspect_scope(table)
+    
+    assert not errors, "\n".join(errors)
+
+
 if __name__ == "__main__":
+    import sys
     sys.exit(pytest.main([__file__, "-v"]))
